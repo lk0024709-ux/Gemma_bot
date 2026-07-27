@@ -1,24 +1,32 @@
-# Gemma 3 Neuro-System — Backend
+# Gemma 3 Neuro-System — Monolithic Fullstack
 
-Production-ready FastAPI backend powering an AI "neuro-system" built on Google's
-**Gemma 3** model family. One codebase serves **both** a Telegram bot and a web
-dashboard, with automatic multi-provider fallback and a private Telegram channel
+Production-ready FastAPI app powering an AI "neuro-system" built on Google's
+**Gemma 3** model family. **One single service** serves the web dashboard, the
+JSON API and the Telegram bot — deployable on Render's free tier as one web
+service, with automatic multi-provider fallback and a private Telegram channel
 used as a JSON memory store.
 
 ```
-gemma3-neuro-backend/
-├── main.py            # FastAPI application & entry point
+gemma3-neuro-system/
+├── main.py            # FastAPI server (serves API + static web UI)
 ├── ai_router.py       # Multi-API fallback logic for Gemma 3
 ├── bot_handler.py     # Telegram bot logic (background thread)
 ├── tg_db.py           # Telegram channel database logic
 ├── requirements.txt   # Python dependencies
 ├── .env.example       # Environment variable template
 ├── .gitignore         # Python gitignore (excludes .env)
-└── README.md
+├── README.md
+└── frontend/          # Static web dashboard (served by FastAPI)
+    ├── index.html
+    ├── style.css
+    └── app.js
 ```
 
 ## Features
 
+- **Monolithic fullstack** — FastAPI mounts `frontend/` via `StaticFiles`, so `/`
+  returns the dashboard while `/api/*` keeps serving JSON. One port, one deploy,
+  no CORS headaches, no separate frontend host.
 - **4-tier AI fallback** — Google AI Studio → Groq → OpenRouter → Hugging Face.
   If one provider is down, rate-limited or missing a key, the next one takes over
   transparently.
@@ -81,7 +89,14 @@ uvicorn main:app --host 0.0.0.0 --port 8000 --reload
 python main.py
 ```
 
-Interactive docs: <http://localhost:8000/docs>
+| URL | What |
+|-----|------|
+| <http://localhost:8000/> | Web dashboard |
+| <http://localhost:8000/docs> | Interactive API docs |
+| <http://localhost:8000/health> | Health / keep-alive |
+
+Editing files in `frontend/` takes effect on refresh — no build step, no bundler.
+If the folder is missing the app still boots in API-only mode.
 
 Run the bot alone (no API):
 
@@ -118,7 +133,8 @@ Optional fields: `history` (`[{"role":"user","content":"…"}]`), `system_prompt
 
 | Method | Path | Description |
 |--------|------|-------------|
-| `GET`  | `/` | Service banner |
+| `GET`  | `/` | The web dashboard (`frontend/index.html`) |
+| `GET`  | `/api` | Service banner (JSON) |
 | `GET`  | `/health` | Providers + bot + channel health |
 | `GET`  | `/api/providers` | Fallback chain and key configuration |
 | `POST` | `/api/memory` | Store an arbitrary JSON record in the channel |
@@ -135,23 +151,60 @@ from tg_db import save_memory_to_channel
 message_id = save_memory_to_channel(CHANNEL_ID, BOT_TOKEN, {"event": "boot", "ok": True})
 ```
 
-## Deployment
+## Deploy to Render (free tier)
 
-Any container/PaaS host works (Railway, Render, Fly.io, VPS):
+Create a new **Web Service** from this repo:
 
-```bash
-uvicorn main:app --host 0.0.0.0 --port $PORT --workers 1
-```
+| Setting | Value |
+|---------|-------|
+| Environment | Python 3 |
+| Build command | `pip install -r requirements.txt` |
+| Start command | `uvicorn main:app --host 0.0.0.0 --port $PORT --workers 1` |
+
+Add your `GOOGLE_API_KEY` / `GROQ_API_KEY` / `TELEGRAM_BOT_TOKEN` / etc. under
+**Environment → Environment Variables** (never commit `.env`). Render injects
+`$PORT` automatically. Once live, `https://<your-app>.onrender.com/` shows the
+dashboard and `/api/chat` serves the API — same origin, one service.
 
 > Keep `--workers 1`, or set `ENABLE_TELEGRAM_BOT=false` on extra workers — multiple
 > polling threads on the same bot token cause Telegram `409 Conflict` errors.
+
+### Keep it awake (free tier sleeps after 15 min)
+
+Point an external cron at `/health` every 10 minutes:
+
+- [cron-job.org](https://cron-job.org) or [UptimeRobot](https://uptimerobot.com) →
+  monitor `https://<your-app>.onrender.com/health` at a 10-minute interval.
+- Or a GitHub Action:
+
+```yaml
+name: keep-alive
+on:
+  schedule:
+    - cron: "*/10 * * * *"
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    steps:
+      - run: curl -fsS https://<your-app>.onrender.com/health
+```
+
+`/health` makes **no outbound calls** by default, so pinging it is cheap. It also
+answers `HEAD`. Use `/health?deep=true` when you want the Telegram token/channel
+verified too.
+
+Other hosts (Railway, Fly.io, a VPS) work with the same start command.
 
 ## Security notes
 
 - `.env` is git-ignored; only `.env.example` is committed.
 - Keys are read exclusively from the environment — nothing is hard-coded.
-- CORS is wide open by design for public dashboards; put the service behind an API
-  gateway or add auth before exposing it in production.
+- CORS is **not** wide open: the dashboard is same-origin so it needs no grant.
+  Only localhost dev origins are allowed by default; add more via `ALLOWED_ORIGINS`
+  (comma-separated) or `ALLOWED_ORIGIN_REGEX`, or set `ALLOWED_ORIGINS=*` to opt back
+  into the permissive behaviour.
+- There is no authentication on `/api/chat` — anyone who finds your URL can spend
+  your API quota. Add an API key or rate limiting before sharing it publicly.
 
 ## License
 

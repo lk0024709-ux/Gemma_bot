@@ -1,13 +1,14 @@
 """
 main.py
 ========
-FastAPI entry point for the **Gemma 3 Neuro-System** backend.
+FastAPI entry point for the **Gemma 3 Neuro-System** — monolithic fullstack app.
 
-Responsibilities
-----------------
-* Expose a JSON chat API consumed by the web dashboard (CORS open to all origins).
-* Start the Telegram bot polling thread on application startup.
-* Provide health / provider introspection endpoints for monitoring.
+A single Render web service that simultaneously:
+
+* serves the static frontend (``frontend/``) as a dashboard UI,
+* exposes the JSON chat API consumed by that dashboard,
+* runs the Telegram bot polling loop in a background thread,
+* answers ``/health`` so an external cron job can keep the free tier awake.
 
 Run locally::
 
@@ -21,12 +22,14 @@ import os
 import time
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Request, status
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import FileResponse, JSONResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, field_validator
 
 from ai_router import (
@@ -56,6 +59,43 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHANNEL_ID = os.getenv("TELEGRAM_CHANNEL_ID", "").strip()
 
 _STARTED_AT = time.time()
+
+# --------------------------------------------------------------------------- #
+# Frontend (monolithic fullstack: the API also serves the dashboard)           #
+# --------------------------------------------------------------------------- #
+
+# Resolved relative to this file, not the CWD, so the app works no matter where
+# Render (or you) launches uvicorn from.
+BASE_DIR = Path(__file__).resolve().parent
+FRONTEND_DIR = Path(os.getenv("FRONTEND_DIR", BASE_DIR / "frontend")).resolve()
+INDEX_FILE = FRONTEND_DIR / "index.html"
+FRONTEND_AVAILABLE = INDEX_FILE.is_file()
+
+# --------------------------------------------------------------------------- #
+# CORS                                                                         #
+# --------------------------------------------------------------------------- #
+# The dashboard is same-origin now, so it needs no CORS grant at all. We only
+# allow the local dev origins (Vite/Live Server/etc.) plus anything explicitly
+# listed in ALLOWED_ORIGINS, e.g.
+#     ALLOWED_ORIGINS=https://my-dashboard.vercel.app,https://app.example.com
+# Set ALLOWED_ORIGINS=* to restore the old wide-open behaviour.
+
+DEFAULT_DEV_ORIGINS = [
+    "http://localhost:3000",
+    "http://localhost:5173",
+    "http://localhost:8000",
+    "http://127.0.0.1:3000",
+    "http://127.0.0.1:5173",
+    "http://127.0.0.1:8000",
+]
+_raw_origins = os.getenv("ALLOWED_ORIGINS", "").strip()
+if _raw_origins == "*":
+    CORS_ORIGINS: List[str] = ["*"]
+    CORS_ALLOW_CREDENTIALS = False  # browsers reject "*" together with credentials
+else:
+    _extra = [o.strip().rstrip("/") for o in _raw_origins.split(",") if o.strip()]
+    CORS_ORIGINS = list(dict.fromkeys(DEFAULT_DEV_ORIGINS + _extra))
+    CORS_ALLOW_CREDENTIALS = True
 
 
 # --------------------------------------------------------------------------- #
@@ -116,6 +156,12 @@ async def lifespan(app: FastAPI):
             provider["model"],
             "configured" if provider["configured"] else "MISSING KEY",
         )
+    if FRONTEND_AVAILABLE:
+        logger.info("  frontend     serving %s", FRONTEND_DIR)
+    else:
+        logger.warning("  frontend     %s not found - UI disabled, API still up", INDEX_FILE)
+    logger.info("  cors         %s", ", ".join(CORS_ORIGINS))
+
     try:
         thread = start_bot_thread()
         logger.info("Telegram bot thread: %s", "started" if thread else "not started")
@@ -138,12 +184,13 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-# CORS: open to all origins so any web dashboard can call the API.
+# CORS: same-origin dashboard needs none; this covers local dev + extra origins.
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=False,  # must be False when allow_origins is "*"
-    allow_methods=["*"],
+    allow_origins=CORS_ORIGINS,
+    allow_origin_regex=os.getenv("ALLOWED_ORIGIN_REGEX") or None,
+    allow_credentials=CORS_ALLOW_CREDENTIALS,
+    allow_methods=["GET", "POST", "OPTIONS"],
     allow_headers=["*"],
 )
 
@@ -167,30 +214,70 @@ async def unhandled_exception_handler(request: Request, exc: Exception) -> JSONR
 # --------------------------------------------------------------------------- #
 
 
-@app.get("/", tags=["meta"])
-async def root() -> Dict[str, Any]:
-    """Service banner."""
+@app.get("/", include_in_schema=False)
+async def serve_index() -> Any:
+    """Serve the dashboard's ``index.html`` (monolithic fullstack root)."""
+    if not FRONTEND_AVAILABLE:
+        return JSONResponse(
+            status_code=status.HTTP_200_OK,
+            content={
+                "name": APP_NAME,
+                "version": APP_VERSION,
+                "status": "online",
+                "detail": "Frontend not found; API endpoints are available.",
+                "endpoints": ["/api/chat", "/api/providers", "/health", "/docs"],
+            },
+        )
+    # no-cache so a redeploy never leaves users on a stale dashboard shell
+    return FileResponse(INDEX_FILE, headers={"Cache-Control": "no-cache"})
+
+
+@app.get("/api", tags=["meta"])
+async def api_root() -> Dict[str, Any]:
+    """Service banner (the JSON that used to live at ``/``)."""
     return {
         "name": APP_NAME,
         "version": APP_VERSION,
         "status": "online",
         "uptime_seconds": int(time.time() - _STARTED_AT),
+        "frontend": FRONTEND_AVAILABLE,
         "endpoints": ["/api/chat", "/api/providers", "/api/memory", "/health", "/docs"],
     }
 
 
 @app.get("/health", tags=["meta"])
-async def health() -> Dict[str, Any]:
-    """Deep health check: API, providers and Telegram integration."""
+async def health(deep: bool = False) -> Dict[str, Any]:
+    """Health check — also the keep-alive target for an external cron job.
+
+    Ping ``GET /health`` every 10 minutes (UptimeRobot, cron-job.org, GitHub
+    Actions, ...) to stop Render's free tier from spinning the service down
+    after 15 minutes of inactivity.
+
+    The default response is intentionally cheap: no outbound network calls, so
+    it stays fast and never burns Telegram API quota. Pass ``?deep=true`` to
+    additionally verify the bot token and channel access.
+    """
     providers = available_providers()
-    return {
+    payload: Dict[str, Any] = {
         "status": "healthy" if any(p["configured"] for p in providers) else "degraded",
         "uptime_seconds": int(time.time() - _STARTED_AT),
         "providers": providers,
+        "frontend": FRONTEND_AVAILABLE,
         "telegram_bot": get_bot_status(),
-        "telegram_db": tg_health_check(),
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
+    if deep:
+        try:
+            payload["telegram_db"] = tg_health_check()
+        except Exception as exc:  # noqa: BLE001 - health must never 500
+            payload["telegram_db"] = {"error": str(exc)}
+    return payload
+
+
+@app.head("/health", include_in_schema=False)
+async def health_head() -> JSONResponse:
+    """Cheapest possible keep-alive: uptime monitors often send HEAD."""
+    return JSONResponse(content=None, status_code=status.HTTP_200_OK)
 
 
 @app.get("/api/providers", tags=["ai"])
@@ -287,6 +374,26 @@ async def bot_restart() -> Dict[str, Any]:
     stop_bot()
     thread = start_bot_thread()
     return {"success": bool(thread), "bot": get_bot_status()}
+
+
+# --------------------------------------------------------------------------- #
+# Static frontend mounts                                                       #
+# --------------------------------------------------------------------------- #
+# IMPORTANT: these are registered *after* every API route. Starlette matches
+# routes in registration order, so /api/*, /health and /docs always win and the
+# catch-all mount below only handles what's left (CSS, JS, images, favicon...).
+
+if FRONTEND_AVAILABLE:
+    # Explicit prefix — handy for absolute asset URLs like /static/style.css
+    app.mount("/static", StaticFiles(directory=FRONTEND_DIR), name="static")
+
+    # Root mount: serves /style.css, /app.js, /favicon.ico natively, and
+    # html=True makes directory requests fall back to index.html.
+    app.mount("/", StaticFiles(directory=FRONTEND_DIR, html=True), name="frontend")
+else:
+    logger.warning(
+        "Frontend directory %s is missing - running in API-only mode", FRONTEND_DIR
+    )
 
 
 # --------------------------------------------------------------------------- #

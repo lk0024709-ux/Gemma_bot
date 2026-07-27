@@ -2,24 +2,41 @@
    Gemma 3 Neuro-System — dark theme dashboard
    ========================================================================== */
 
+/* --------------------------------------------------------------------------
+   Theming
+   Inside Telegram the Mini App SDK injects --tg-theme-* variables, so the UI
+   follows the user's own light/dark theme. Outside Telegram those variables
+   are undefined and the second argument of var() supplies our dark palette.
+   -------------------------------------------------------------------------- */
+
 :root {
-  --bg: #0a0c10;
-  --bg-soft: #10141b;
-  --panel: #141922;
-  --panel-2: #1a212c;
-  --border: #232c3a;
-  --text: #e6edf7;
-  --muted: #8b98ab;
-  --accent: #6ea8fe;
+  --bg:      var(--tg-theme-bg-color, #0a0c10);
+  --bg-soft: var(--tg-theme-secondary-bg-color, #10141b);
+  --panel:   var(--tg-theme-secondary-bg-color, #141922);
+  --panel-2: var(--tg-theme-secondary-bg-color, #1a212c);
+  --border:  var(--tg-theme-section-separator-color, #232c3a);
+  --text:    var(--tg-theme-text-color, #e6edf7);
+  --muted:   var(--tg-theme-hint-color, #8b98ab);
+  --accent:  var(--tg-theme-link-color, #6ea8fe);
   --accent-2: #a78bfa;
-  --accent-grad: linear-gradient(135deg, #6ea8fe 0%, #a78bfa 100%);
+  --btn-bg:   var(--tg-theme-button-color, #6ea8fe);
+  --btn-text: var(--tg-theme-button-text-color, #0a0c10);
+  --accent-grad: linear-gradient(135deg, var(--accent) 0%, var(--accent-2) 100%);
   --ok: #3fb950;
   --warn: #d29922;
-  --err: #f85149;
+  --err: var(--tg-theme-destructive-text-color, #f85149);
   --radius: 14px;
   --radius-sm: 9px;
   --shadow: 0 10px 30px rgba(0, 0, 0, .45);
   --sidebar-w: 300px;
+}
+
+/* In Telegram, panels need a touch of contrast against the page background
+   because bg and secondary-bg can be very close on some themes. */
+body.tma {
+  --panel: color-mix(in srgb, var(--tg-theme-secondary-bg-color, #141922) 92%, var(--text));
+  --panel-2: color-mix(in srgb, var(--tg-theme-secondary-bg-color, #1a212c) 85%, var(--text));
+  --border: color-mix(in srgb, var(--tg-theme-bg-color, #232c3a) 80%, var(--text));
 }
 
 * { box-sizing: border-box; margin: 0; padding: 0; }
@@ -350,13 +367,68 @@ input[type="number"]:focus { outline: none; border-color: var(--accent); }
   width: 38px; height: 38px; flex-shrink: 0;
   display: grid; place-items: center;
   border: none; border-radius: 10px;
-  background: var(--accent-grad); color: #0a0c10;
+  background: var(--btn-bg); color: var(--btn-text);
   cursor: pointer; transition: .18s;
 }
 .btn-send:hover:not(:disabled) { transform: translateY(-1px); box-shadow: 0 6px 16px rgba(110, 168, 254, .32); }
 .btn-send:disabled { opacity: .4; cursor: not-allowed; }
 
 .composer-hint { max-width: 860px; margin: 9px auto 0; text-align: center; font-size: 11px; color: var(--muted); }
+
+/* ==========================================================================
+   Force-subscribe gate
+   ========================================================================== */
+
+.gate {
+  position: fixed; inset: 0; z-index: 100;
+  display: grid; place-items: center;
+  padding: 24px;
+  background: color-mix(in srgb, var(--bg) 88%, transparent);
+  backdrop-filter: blur(8px);
+  animation: fade .25s ease;
+}
+.gate[hidden] { display: none; }
+@keyframes fade { from { opacity: 0; } }
+
+.gate-card {
+  width: 100%; max-width: 380px;
+  text-align: center;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 30px 24px;
+  box-shadow: var(--shadow);
+}
+.gate-icon { font-size: 42px; margin-bottom: 12px; }
+.gate-card h2 { font-size: 20px; font-weight: 660; margin-bottom: 9px; }
+.gate-card p { color: var(--muted); font-size: 14px; margin-bottom: 20px; }
+
+.btn-primary {
+  display: block;
+  background: var(--btn-bg); color: var(--btn-text);
+  border: none; border-radius: var(--radius-sm);
+  padding: 12px 18px; margin-bottom: 10px;
+  font: inherit; font-size: 14px; font-weight: 600;
+  text-decoration: none; cursor: pointer;
+  transition: .18s;
+}
+.btn-primary:hover { filter: brightness(1.08); transform: translateY(-1px); }
+
+.gate-card .btn-ghost { width: 100%; }
+.gate-hint { font-size: 12px; margin: 12px 0 0 !important; min-height: 16px; }
+.gate-hint.err { color: var(--err); }
+.gate-hint.ok { color: var(--ok); }
+
+/* Inline join prompt rendered inside a chat bubble */
+.join-inline {
+  display: inline-block;
+  margin-top: 10px;
+  background: var(--btn-bg); color: var(--btn-text);
+  padding: 9px 16px; border-radius: var(--radius-sm);
+  font-size: 13px; font-weight: 600;
+  text-decoration: none; border: none; cursor: pointer;
+}
+.join-inline:hover { filter: brightness(1.08); }
 
 /* ==========================================================================
    Responsive

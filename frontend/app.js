@@ -11,10 +11,57 @@
     chat: "/api/chat",
     health: "/health",
     providers: "/api/providers",
+    config: "/api/config",
+    membership: (id) => `/api/membership/${id}`,
   };
   const HISTORY_LIMIT = 10;      // messages sent back as context
   const HEALTH_POLL_MS = 60_000; // refresh sidebar every minute
   const REQUEST_TIMEOUT_MS = 120_000;
+
+  // ------------------------------------------------- Telegram Mini App init
+  // window.Telegram only exists when the page is opened inside Telegram (or if
+  // the CDN script loaded). Everything below degrades gracefully in a browser.
+  const tg = window.Telegram?.WebApp || null;
+  const inTelegram = Boolean(tg && tg.initData !== undefined && tg.platform !== "unknown");
+  let tgUserId = null;
+  let inviteLink = "";
+
+  if (tg) {
+    try {
+      tg.ready();
+      tg.expand?.();
+      tgUserId = tg.initDataUnsafe?.user?.id ?? null;
+      if (inTelegram) document.body.classList.add("tma");
+    } catch (err) {
+      console.warn("Telegram WebApp init failed:", err);
+    }
+  }
+
+  /** Open a t.me link via Telegram when available, else a normal new tab. */
+  function openChannel(link) {
+    if (!link) return;
+    try {
+      if (tg && typeof tg.openTelegramLink === "function" && /^https?:\/\/t\.me\//i.test(link)) {
+        tg.openTelegramLink(link);
+        return;
+      }
+      if (tg && typeof tg.openLink === "function") {
+        tg.openLink(link);
+        return;
+      }
+    } catch (err) {
+      console.warn("Telegram link open failed, falling back:", err);
+    }
+    window.open(link, "_blank", "noopener");
+  }
+
+  const haptic = (type) => {
+    try {
+      tg?.HapticFeedback?.notificationOccurred?.(type);
+    } catch {
+      /* not available outside Telegram */
+    }
+  };
 
   // ------------------------------------------------------------------- dom
   const $ = (id) => document.getElementById(id);
@@ -38,6 +85,11 @@
     tempValue: $("tempValue"),
     maxTokens: $("maxTokens"),
     useHistory: $("useHistory"),
+    gate: $("gate"),
+    gateText: $("gateText"),
+    gateJoin: $("gateJoin"),
+    gateRecheck: $("gateRecheck"),
+    gateHint: $("gateHint"),
   };
 
   /** @type {{role: "user"|"assistant", content: string}[]} */
@@ -162,6 +214,7 @@
       temperature: parseFloat(els.temperature.value),
       max_tokens: parseInt(els.maxTokens.value, 10) || 1024,
     };
+    if (tgUserId != null) payload.telegram_user_id = tgUserId;
     if (els.useHistory.checked && history.length) {
       payload.history = history.slice(-HISTORY_LIMIT);
     }
@@ -185,6 +238,15 @@
       }
 
       typing.remove();
+
+      // --- Force-subscribe: user has not joined the channel --------------- //
+      if (res.status === 403 && data && data.error === "FORBIDDEN_NOT_MEMBER") {
+        inviteLink = data.invite_link || inviteLink;
+        haptic("error");
+        showJoinPrompt(data.message);
+        els.modelLine.textContent = "Access denied";
+        return;
+      }
 
       if (!res.ok) {
         const detail =
@@ -223,6 +285,164 @@
       busy = false;
       els.sendBtn.disabled = false;
       els.input.focus();
+    }
+  }
+
+  // ------------------------------------------------------ force-subscribe
+  /** Render the "join the channel" message inside the chat transcript. */
+  function showJoinPrompt(message) {
+    hideWelcome();
+
+    const row = document.createElement("div");
+    row.className = "msg bot error";
+
+    const avatar = document.createElement("div");
+    avatar.className = "avatar";
+    avatar.textContent = "🔒";
+
+    const body = document.createElement("div");
+    body.className = "body";
+
+    const who = document.createElement("div");
+    who.className = "who";
+    who.textContent = "Access";
+
+    const content = document.createElement("div");
+    content.className = "content";
+    content.textContent =
+      message || "🔒 Access Denied! Please join our channel to use this AI.";
+
+    body.append(who, content);
+
+    if (!tgUserId && !inTelegram) {
+      const note = document.createElement("div");
+      note.className = "meta";
+      note.textContent =
+        "Open this app from inside Telegram so we can verify your membership.";
+      body.appendChild(note);
+    }
+
+    if (inviteLink) {
+      const link = document.createElement("a");
+      link.className = "join-inline";
+      link.href = inviteLink;
+      link.target = "_blank";
+      link.rel = "noopener";
+      link.textContent = "📢 Join Channel";
+      link.addEventListener("click", (e) => {
+        // Inside Telegram, open natively instead of spawning a browser tab.
+        if (tg && typeof tg.openTelegramLink === "function") {
+          e.preventDefault();
+          openChannel(inviteLink);
+        }
+      });
+      body.appendChild(link);
+
+      const recheck = document.createElement("button");
+      recheck.className = "join-inline";
+      recheck.type = "button";
+      recheck.style.marginLeft = "8px";
+      recheck.textContent = "✅ I've joined";
+      recheck.addEventListener("click", () => recheckMembership(recheck));
+      body.appendChild(recheck);
+    }
+
+    row.append(avatar, body);
+    els.messages.appendChild(row);
+    scrollDown();
+  }
+
+  /** Ask the backend to re-verify membership (after the user joins). */
+  async function recheckMembership(btn) {
+    if (tgUserId == null) {
+      showGate("Open this Mini App from Telegram so we can verify your membership.");
+      return;
+    }
+    const original = btn ? btn.textContent : null;
+    if (btn) {
+      btn.disabled = true;
+      btn.textContent = "Checking…";
+    }
+    try {
+      const res = await fetch(API.membership(tgUserId), { cache: "no-store" });
+      const data = await res.json();
+      if (data.is_member) {
+        haptic("success");
+        hideGate();
+        addMessage("assistant", "✅ Membership verified — you're all set. Ask me anything!");
+      } else {
+        haptic("error");
+        setGateHint("Still not a member. Join the channel, then try again.", "err");
+        if (btn) btn.textContent = "❌ Not yet — retry";
+      }
+    } catch (err) {
+      setGateHint(`Could not verify: ${err.message}`, "err");
+      if (btn) btn.textContent = original || "✅ I've joined";
+    } finally {
+      if (btn) {
+        btn.disabled = false;
+        setTimeout(() => {
+          if (original) btn.textContent = original;
+        }, 2500);
+      }
+    }
+  }
+
+  function setGateHint(text, kind) {
+    els.gateHint.textContent = text || "";
+    els.gateHint.className = `gate-hint${kind ? " " + kind : ""}`;
+  }
+
+  function showGate(reason) {
+    if (reason) els.gateText.textContent = reason;
+    if (inviteLink) {
+      els.gateJoin.href = inviteLink;
+      els.gateJoin.hidden = false;
+    } else {
+      els.gateJoin.hidden = true;
+    }
+    els.gate.hidden = false;
+  }
+
+  const hideGate = () => {
+    els.gate.hidden = true;
+    setGateHint("");
+  };
+
+  /** Load public config and, when force-subscribe is on, pre-verify the user. */
+  async function initGate() {
+    let cfg;
+    try {
+      const res = await fetch(API.config, { cache: "no-store" });
+      cfg = await res.json();
+    } catch (err) {
+      console.warn("Could not load config:", err);
+      return;
+    }
+
+    inviteLink = cfg.invite_link || "";
+    if (!cfg.force_subscribe) return; // gate disabled server-side
+
+    if (tgUserId == null) {
+      // Opened outside Telegram (or initData unavailable): explain, don't block
+      // silently. The server still enforces the rule on every request.
+      showGate(
+        inTelegram
+          ? "We couldn't read your Telegram account. Please reopen the app from the bot."
+          : "This app must be opened from inside Telegram so we can verify your channel membership."
+      );
+      els.gateRecheck.hidden = !inTelegram;
+      return;
+    }
+
+    try {
+      const res = await fetch(API.membership(tgUserId), { cache: "no-store" });
+      const data = await res.json();
+      if (!data.is_member) {
+        showGate("Please join our channel to use this AI.");
+      }
+    } catch (err) {
+      console.warn("Membership pre-check failed:", err);
     }
   }
 
@@ -323,8 +543,18 @@
     }
   });
 
+  els.gateJoin.addEventListener("click", (e) => {
+    if (tg && typeof tg.openTelegramLink === "function" && inviteLink) {
+      e.preventDefault();
+      openChannel(inviteLink);
+    }
+  });
+
+  els.gateRecheck.addEventListener("click", () => recheckMembership(els.gateRecheck));
+
   // ----------------------------------------------------------------- init
+  initGate();
   refreshHealth();
   setInterval(refreshHealth, HEALTH_POLL_MS);
-  els.input.focus();
+  if (!inTelegram) els.input.focus(); // avoid forcing the keyboard open on mobile
 })();

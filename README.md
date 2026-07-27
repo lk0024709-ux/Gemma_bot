@@ -27,6 +27,9 @@ gemma3-neuro-system/
 - **Monolithic fullstack** — FastAPI mounts `frontend/` via `StaticFiles`, so `/`
   returns the dashboard while `/api/*` keeps serving JSON. One port, one deploy,
   no CORS headaches, no separate frontend host.
+- **Telegram Mini App + Force Subscribe** — the dashboard doubles as a TMA that
+  follows the user's Telegram theme. Both the bot and `/api/chat` verify channel
+  membership with `get_chat_member()` before spending a single AI token.
 - **4-tier AI fallback** — Google AI Studio → Groq → OpenRouter → Hugging Face.
   If one provider is down, rate-limited or missing a key, the next one takes over
   transparently.
@@ -135,11 +138,56 @@ Optional fields: `history` (`[{"role":"user","content":"…"}]`), `system_prompt
 |--------|------|-------------|
 | `GET`  | `/` | The web dashboard (`frontend/index.html`) |
 | `GET`  | `/api` | Service banner (JSON) |
+| `GET`  | `/api/config` | Public client config (force-subscribe, invite link) |
+| `GET`  | `/api/membership/{id}` | Re-check a user's channel membership |
 | `GET`  | `/health` | Providers + bot + channel health |
 | `GET`  | `/api/providers` | Fallback chain and key configuration |
 | `POST` | `/api/memory` | Store an arbitrary JSON record in the channel |
 | `GET`  | `/api/bot/status` | Telegram thread diagnostics |
 | `POST` | `/api/bot/restart` | Restart the polling thread |
+
+## Force Subscribe (channel gate)
+
+Require users to join a channel before the AI answers — in **both** the bot and
+the Mini App.
+
+```bash
+REQUIRED_CHANNEL_ID=@mychannel          # @handle or -100...  (empty = disabled)
+CHANNEL_INVITE_LINK=https://t.me/mychannel   # auto-derived from an @handle
+```
+
+**The bot must be an administrator of that channel**, otherwise `get_chat_member()`
+fails. When the check errors the request is denied (fail-closed); set
+`FORCE_SUB_FAIL_OPEN=true` to invert that.
+
+Behaviour:
+
+- **Bot** — non-members get `🔒 Access Denied! Please join our channel to use this AI.`
+  plus a *Join Channel* button and an *I've Joined* button that re-verifies instantly.
+  The AI router is never called for them.
+- **API** — `POST /api/chat` requires `telegram_user_id`. Non-members get **403**:
+  ```json
+  { "error": "FORBIDDEN_NOT_MEMBER", "invite_link": "https://t.me/mychannel" }
+  ```
+- **Caching** — verdicts are cached (`MEMBERSHIP_CACHE_TTL`, default 300s; negative
+  results only 20s) so joining takes effect almost immediately without hammering
+  Telegram.
+
+## Telegram Mini App
+
+`frontend/` loads the official `telegram-web-app.js` SDK, calls `tg.ready()`, reads
+the user id from `tg.initDataUnsafe.user.id` and sends it as `telegram_user_id`.
+The CSS maps `--tg-theme-*` variables onto the palette, so the UI matches the
+user's light/dark theme automatically — and falls back to the built-in dark theme
+when opened in a plain browser.
+
+To register it: **@BotFather → /newapp** (or *Bot Settings → Menu Button*) and point
+it at your Render URL.
+
+> **Security note:** `initDataUnsafe` is, as the name says, unverified — a crafted
+> request can claim any `telegram_user_id`. It's fine as a "join the channel" nudge,
+> but for real authorisation validate the signed `initData` HMAC server-side with
+> your bot token before trusting the id.
 
 ## Using the modules directly
 

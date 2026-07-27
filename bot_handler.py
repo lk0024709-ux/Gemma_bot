@@ -57,6 +57,33 @@ POLLING_TIMEOUT = int(os.getenv("BOT_POLLING_TIMEOUT", "30"))
 POLLING_RESTART_DELAY = int(os.getenv("BOT_RESTART_DELAY", "10"))
 TELEGRAM_MSG_LIMIT = 4096
 
+# --------------------------------------------------------------------------- #
+# Force-subscribe / channel membership gate                                    #
+# --------------------------------------------------------------------------- #
+
+# Channel users must join before they can talk to the AI (@handle or -100... id).
+REQUIRED_CHANNEL_ID = os.getenv("REQUIRED_CHANNEL_ID", "").strip()
+CHANNEL_INVITE_LINK = os.getenv("CHANNEL_INVITE_LINK", "").strip()
+
+# Membership results are cached briefly so we don't hit the Telegram API on
+# every single message (keeps replies fast and avoids rate limits).
+MEMBERSHIP_CACHE_TTL = int(os.getenv("MEMBERSHIP_CACHE_TTL", "300"))  # seconds
+# Negative results expire quickly so a user who just joined isn't stuck waiting.
+MEMBERSHIP_NEGATIVE_TTL = int(os.getenv("MEMBERSHIP_NEGATIVE_TTL", "20"))
+
+# If the membership check itself fails (bot not admin, channel not found,
+# Telegram outage) should we let the user through? Default: NO (fail closed),
+# because failing open silently disables the whole gate.
+FORCE_SUB_FAIL_OPEN = os.getenv("FORCE_SUB_FAIL_OPEN", "false").lower() in ("1", "true", "yes")
+
+# Statuses that count as "in the channel".
+MEMBER_STATUSES = frozenset({"member", "administrator", "creator"})
+
+ACCESS_DENIED_TEXT = "🔒 Access Denied! Please join our channel to use this AI."
+
+_membership_cache: Dict[int, tuple] = {}  # user_id -> (is_member, expires_at)
+_membership_lock = threading.Lock()
+
 WELCOME_TEXT = (
     "👋 *Gemma 3 Neuro-System online*\n\n"
     "Send me any message and I'll answer using the Gemma 3 model family "
@@ -80,6 +107,8 @@ HELP_TEXT = (
 # --------------------------------------------------------------------------- #
 
 bot: Optional["telebot.TeleBot"] = None
+# Fallback instance used by the REST API when polling is disabled.
+_api_bot: Optional["telebot.TeleBot"] = None
 _bot_thread: Optional[threading.Thread] = None
 _stop_event = threading.Event()
 _lock = threading.Lock()
@@ -93,6 +122,7 @@ _stats: Dict[str, Any] = {
     "started_at": None,
     "messages_handled": 0,
     "errors": 0,
+    "blocked": 0,  # requests rejected by the force-subscribe gate
     "last_provider": None,
     "running": False,
 }
@@ -171,6 +201,156 @@ def _archive(message: Any, prompt: str, response: str, provider: Optional[str]) 
 
 
 # --------------------------------------------------------------------------- #
+# Force-subscribe helpers                                                      #
+# --------------------------------------------------------------------------- #
+
+
+def force_sub_enabled() -> bool:
+    """The gate is only active once a required channel is configured."""
+    return bool(REQUIRED_CHANNEL_ID)
+
+
+def _cache_get(user_id: int) -> Optional[bool]:
+    with _membership_lock:
+        entry = _membership_cache.get(user_id)
+        if not entry:
+            return None
+        is_member, expires_at = entry
+        if time.time() >= expires_at:
+            _membership_cache.pop(user_id, None)
+            return None
+        return is_member
+
+
+def _cache_set(user_id: int, is_member: bool) -> None:
+    ttl = MEMBERSHIP_CACHE_TTL if is_member else MEMBERSHIP_NEGATIVE_TTL
+    with _membership_lock:
+        # Cheap eviction so the dict can't grow without bound.
+        if len(_membership_cache) > 10_000:
+            now = time.time()
+            for uid, (_, exp) in list(_membership_cache.items()):
+                if now >= exp:
+                    _membership_cache.pop(uid, None)
+        _membership_cache[user_id] = (is_member, time.time() + ttl)
+
+
+def invalidate_membership(user_id: int) -> None:
+    """Drop a cached verdict (e.g. right after the user taps 'I've joined')."""
+    with _membership_lock:
+        _membership_cache.pop(user_id, None)
+
+
+def is_user_member(
+    bot_instance: Any,
+    user_id: int,
+    channel_id: Optional[str] = None,
+    use_cache: bool = True,
+) -> bool:
+    """Return ``True`` if ``user_id`` belongs to ``channel_id``.
+
+    Uses ``bot.get_chat_member()`` and accepts the statuses ``member``,
+    ``administrator`` and ``creator``. ``left`` and ``kicked`` are rejected;
+    ``restricted`` is accepted only when the user is still subscribed
+    (``is_member`` is true), which is how Telegram represents a muted member.
+
+    Any failure (bot is not an admin of the channel, wrong channel id, network
+    error) is swallowed and resolved via :data:`FORCE_SUB_FAIL_OPEN` so a
+    misconfiguration can never crash a request handler.
+    """
+    channel = (channel_id or REQUIRED_CHANNEL_ID or "").strip()
+
+    # No channel configured -> the gate is disabled, everybody is allowed.
+    if not channel:
+        return True
+    if bot_instance is None:
+        logger.warning("Membership check skipped: no bot instance available")
+        return FORCE_SUB_FAIL_OPEN
+    try:
+        user_id = int(user_id)
+    except (TypeError, ValueError):
+        logger.warning("Membership check got an invalid user_id: %r", user_id)
+        return False
+
+    if use_cache:
+        cached = _cache_get(user_id)
+        if cached is not None:
+            return cached
+
+    try:
+        member = bot_instance.get_chat_member(channel, user_id)
+        status = getattr(member, "status", "") or ""
+        is_member = status in MEMBER_STATUSES
+        # A "restricted" user is still in the channel unless is_member is False.
+        if not is_member and status == "restricted":
+            is_member = bool(getattr(member, "is_member", False))
+    except ApiTelegramException as exc:
+        description = str(getattr(exc, "description", exc) or exc).lower()
+        # "user not found" / "participant not found" = a definitive "not a member",
+        # not an infrastructure failure, so don't fail-open on it.
+        if "not found" in description:
+            logger.debug("User %s is not a participant of %s", user_id, channel)
+            _cache_set(user_id, False)
+            return False
+        logger.error(
+            "Membership check failed for user %s in %s: %s "
+            "(is the bot an administrator of the channel?)",
+            user_id, channel, exc,
+        )
+        return FORCE_SUB_FAIL_OPEN
+    except Exception as exc:  # noqa: BLE001 - never propagate into a handler
+        logger.error("Unexpected membership check error for user %s: %s", user_id, exc)
+        return FORCE_SUB_FAIL_OPEN
+
+    _cache_set(user_id, is_member)
+    logger.debug("User %s membership in %s: %s", user_id, channel, is_member)
+    return is_member
+
+
+def build_join_markup() -> Optional[Any]:
+    """Inline keyboard with a 'Join channel' button and a re-check button."""
+    if not TELEBOT_AVAILABLE:
+        return None
+
+    link = CHANNEL_INVITE_LINK
+    if not link and REQUIRED_CHANNEL_ID.startswith("@"):
+        link = f"https://t.me/{REQUIRED_CHANNEL_ID.lstrip('@')}"
+
+    markup = telebot.types.InlineKeyboardMarkup()
+    if link:
+        markup.add(telebot.types.InlineKeyboardButton("📢 Join Channel", url=link))
+    markup.add(telebot.types.InlineKeyboardButton("✅ I've Joined", callback_data="check_membership"))
+    return markup
+
+
+def _send_access_denied(message: Any) -> None:
+    """Send the force-subscribe prompt with the join button."""
+    if bot is None:
+        return
+    try:
+        bot.reply_to(message, ACCESS_DENIED_TEXT, reply_markup=build_join_markup())
+    except Exception as exc:  # noqa: BLE001
+        logger.error("Could not deliver the access-denied prompt: %s", exc)
+
+
+def _guard(message: Any) -> bool:
+    """Return ``True`` when the sender may use the AI, else prompt them to join."""
+    if not force_sub_enabled():
+        return True
+
+    user = getattr(message, "from_user", None)
+    user_id = getattr(user, "id", None)
+    if user_id is None:
+        return FORCE_SUB_FAIL_OPEN
+
+    if is_user_member(bot, user_id, REQUIRED_CHANNEL_ID):
+        return True
+
+    _stats["blocked"] += 1
+    _send_access_denied(message)
+    return False
+
+
+# --------------------------------------------------------------------------- #
 # Bot construction & handlers                                                  #
 # --------------------------------------------------------------------------- #
 
@@ -190,15 +370,22 @@ def create_bot() -> Optional["telebot.TeleBot"]:
 
     @bot.message_handler(commands=["start"])
     def handle_start(message: Any) -> None:
+        # /start always answers - it's how a blocked user learns what to do.
         _conversations.pop(message.chat.id, None)
+        if not _guard(message):
+            return
         _safe_reply(message, WELCOME_TEXT)
 
     @bot.message_handler(commands=["help"])
     def handle_help(message: Any) -> None:
+        if not _guard(message):
+            return
         _safe_reply(message, HELP_TEXT)
 
     @bot.message_handler(commands=["reset"])
     def handle_reset(message: Any) -> None:
+        if not _guard(message):
+            return
         _conversations.pop(message.chat.id, None)
         _safe_reply(message, "🧹 Conversation memory cleared.")
 
@@ -212,11 +399,38 @@ def create_bot() -> Optional["telebot.TeleBot"]:
             lines.append(f"{mark} `{provider['name']}` - {provider['model']}")
         lines += [
             "",
+            f"Force-subscribe: {'on - ' + REQUIRED_CHANNEL_ID if force_sub_enabled() else 'off'}",
             f"Messages handled: {_stats['messages_handled']}",
+            f"Blocked (not a member): {_stats['blocked']}",
             f"Errors: {_stats['errors']}",
             f"Last provider used: {_stats['last_provider'] or 'n/a'}",
         ]
         _safe_reply(message, "\n".join(lines))
+
+    @bot.callback_query_handler(func=lambda call: call.data == "check_membership")
+    def handle_check_membership(call: Any) -> None:
+        """Re-verify membership when the user taps '✅ I've Joined'."""
+        user_id = call.from_user.id
+        invalidate_membership(user_id)  # force a fresh lookup
+
+        if is_user_member(bot, user_id, REQUIRED_CHANNEL_ID, use_cache=False):
+            try:
+                bot.answer_callback_query(call.id, "✅ Verified. You're in!")
+                bot.edit_message_text(
+                    "✅ *Access granted!* Thanks for joining.\n\nSend me a message to get started.",
+                    chat_id=call.message.chat.id,
+                    message_id=call.message.message_id,
+                    parse_mode="Markdown",
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.error("Could not confirm membership to the user: %s", exc)
+        else:
+            try:
+                bot.answer_callback_query(
+                    call.id, "❌ You're still not in the channel. Please join first.", show_alert=True
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.error("Could not answer the callback query: %s", exc)
 
     @bot.message_handler(content_types=["text"])
     def handle_text(message: Any) -> None:
@@ -224,6 +438,10 @@ def create_bot() -> Optional["telebot.TeleBot"]:
         chat_id = message.chat.id
         prompt = (message.text or "").strip()
         if not prompt:
+            return
+
+        # Force-subscribe gate: never reach the AI router for non-members.
+        if not _guard(message):
             return
 
         try:
@@ -256,6 +474,8 @@ def create_bot() -> Optional["telebot.TeleBot"]:
         content_types=["photo", "document", "audio", "voice", "video", "sticker"]
     )
     def handle_unsupported(message: Any) -> None:
+        if not _guard(message):
+            return
         _safe_reply(message, "📎 I can only process text messages right now.")
 
     logger.info("Telegram bot handlers registered")
@@ -351,6 +571,31 @@ def stop_bot() -> None:
     logger.info("Telegram bot stopped")
 
 
+def get_bot() -> Optional[Any]:
+    """Return a ``TeleBot`` usable for API-side calls (e.g. membership checks).
+
+    If polling is disabled or hasn't started yet, a lightweight instance is
+    created on demand so the Mini App gate still works in an API-only
+    deployment. Never raises.
+    """
+    global _api_bot
+
+    if bot is not None:
+        return bot
+    if not TELEBOT_AVAILABLE or not TELEGRAM_BOT_TOKEN:
+        return None
+
+    with _lock:
+        if _api_bot is None:
+            try:
+                _api_bot = telebot.TeleBot(TELEGRAM_BOT_TOKEN, parse_mode=None, threaded=False)
+                logger.info("Created a standalone TeleBot instance for API-side checks")
+            except Exception as exc:  # noqa: BLE001
+                logger.error("Could not create the API-side TeleBot: %s", exc)
+                return None
+    return _api_bot
+
+
 def get_bot_status() -> Dict[str, Any]:
     """Return a snapshot of bot health for the ``/health`` endpoint."""
     uptime = int(time.time() - _stats["started_at"]) if _stats["started_at"] else 0
@@ -361,9 +606,16 @@ def get_bot_status() -> Dict[str, Any]:
         "running": bool(_bot_thread and _bot_thread.is_alive() and _stats["running"]),
         "uptime_seconds": uptime,
         "messages_handled": _stats["messages_handled"],
+        "blocked": _stats["blocked"],
         "errors": _stats["errors"],
         "last_provider": _stats["last_provider"],
         "active_conversations": len(_conversations),
+        "force_subscribe": {
+            "enabled": force_sub_enabled(),
+            "channel": REQUIRED_CHANNEL_ID or None,
+            "invite_link": CHANNEL_INVITE_LINK or None,
+            "fail_open": FORCE_SUB_FAIL_OPEN,
+        },
     }
 
 

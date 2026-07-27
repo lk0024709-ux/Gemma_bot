@@ -28,6 +28,7 @@ from typing import Any, Dict, List, Optional
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Request, status
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, field_validator
@@ -40,7 +41,14 @@ from ai_router import (
     smart_gemma_router,
     smart_gemma_router_verbose,
 )
-from bot_handler import get_bot_status, start_bot_thread, stop_bot
+from bot_handler import (
+    force_sub_enabled,
+    get_bot,
+    get_bot_status,
+    is_user_member,
+    start_bot_thread,
+    stop_bot,
+)
 from tg_db import health_check as tg_health_check
 from tg_db import log_interaction, save_memory_to_channel
 
@@ -57,6 +65,17 @@ APP_VERSION = "1.0.0"
 LOG_WEB_TO_CHANNEL = os.getenv("LOG_WEB_TO_CHANNEL", "true").lower() in ("1", "true", "yes")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHANNEL_ID = os.getenv("TELEGRAM_CHANNEL_ID", "").strip()
+
+# --------------------------------------------------------------------------- #
+# Force-subscribe (Telegram Mini App gate)                                     #
+# --------------------------------------------------------------------------- #
+# Channel the user must join before the AI answers. Empty = gate disabled.
+REQUIRED_CHANNEL_ID = os.getenv("REQUIRED_CHANNEL_ID", "").strip()
+CHANNEL_INVITE_LINK = os.getenv("CHANNEL_INVITE_LINK", "").strip()
+
+# Derive a usable invite link from an @handle when none was supplied.
+if not CHANNEL_INVITE_LINK and REQUIRED_CHANNEL_ID.startswith("@"):
+    CHANNEL_INVITE_LINK = f"https://t.me/{REQUIRED_CHANNEL_ID.lstrip('@')}"
 
 _STARTED_AT = time.time()
 
@@ -117,6 +136,10 @@ class ChatRequest(BaseModel):
     temperature: float = Field(default=DEFAULT_TEMPERATURE, ge=0.0, le=2.0)
     max_tokens: int = Field(default=DEFAULT_MAX_TOKENS, ge=1, le=8192)
     user_id: Optional[str] = Field(default=None, description="Client identifier for logging")
+    telegram_user_id: Optional[int] = Field(
+        default=None,
+        description="Telegram user id from the Mini App; required when force-subscribe is on",
+    )
 
     @field_validator("message")
     @classmethod
@@ -161,6 +184,14 @@ async def lifespan(app: FastAPI):
     else:
         logger.warning("  frontend     %s not found - UI disabled, API still up", INDEX_FILE)
     logger.info("  cors         %s", ", ".join(CORS_ORIGINS))
+    if force_sub_enabled():
+        logger.info("  force-sub    ON - users must join %s", REQUIRED_CHANNEL_ID)
+        if not CHANNEL_INVITE_LINK:
+            logger.warning(
+                "  force-sub    CHANNEL_INVITE_LINK is empty - blocked users get no join button"
+            )
+    else:
+        logger.info("  force-sub    off (set REQUIRED_CHANNEL_ID to enable)")
 
     try:
         thread = start_bot_thread()
@@ -280,20 +311,83 @@ async def health_head() -> JSONResponse:
     return JSONResponse(content=None, status_code=status.HTTP_200_OK)
 
 
+@app.get("/api/config", tags=["meta"])
+async def client_config() -> Dict[str, Any]:
+    """Public config the Mini App needs at boot (no secrets)."""
+    return {
+        "success": True,
+        "app_name": APP_NAME,
+        "force_subscribe": force_sub_enabled(),
+        "invite_link": CHANNEL_INVITE_LINK,
+        "channel": REQUIRED_CHANNEL_ID or None,
+    }
+
+
+@app.get("/api/membership/{telegram_user_id}", tags=["telegram"])
+async def check_membership(telegram_user_id: int) -> Dict[str, Any]:
+    """Check whether a Telegram user has joined the required channel.
+
+    Used by the Mini App's "I've joined, re-check" button so the user doesn't
+    have to send a throwaway message to find out.
+    """
+    if not force_sub_enabled():
+        return {"success": True, "is_member": True, "force_subscribe": False}
+
+    is_member = await run_in_threadpool(
+        is_user_member, get_bot(), telegram_user_id, REQUIRED_CHANNEL_ID, False
+    )
+    return {
+        "success": True,
+        "is_member": bool(is_member),
+        "force_subscribe": True,
+        "invite_link": CHANNEL_INVITE_LINK,
+    }
+
+
 @app.get("/api/providers", tags=["ai"])
 async def providers() -> Dict[str, Any]:
     """List the Gemma 3 fallback chain in priority order."""
     return {"success": True, "fallback_order": available_providers()}
 
 
-@app.post("/api/chat", response_model=ChatResponse, tags=["ai"])
-async def chat(payload: ChatRequest) -> ChatResponse:
+@app.post(
+    "/api/chat",
+    response_model=ChatResponse,
+    responses={403: {"description": "User is not a member of the required channel"}},
+    tags=["ai"],
+)
+async def chat(payload: ChatRequest) -> Any:
     """Main chat endpoint.
 
     Accepts ``{"message": "..."}`` (plus optional ``history``, ``system_prompt``,
     ``temperature``, ``max_tokens``) and returns Gemma 3's answer together with
     the provider that served it.
     """
+    # --- Force-subscribe gate -------------------------------------------- #
+    # Runs before any AI call so non-members never consume provider quota.
+    if force_sub_enabled():
+        forbidden = JSONResponse(
+            status_code=status.HTTP_403_FORBIDDEN,
+            content={
+                "error": "FORBIDDEN_NOT_MEMBER",
+                "invite_link": CHANNEL_INVITE_LINK,
+                "message": "🔒 Access Denied! Please join our channel to use this AI.",
+            },
+        )
+
+        if payload.telegram_user_id is None:
+            logger.info("Chat request rejected: no telegram_user_id supplied")
+            return forbidden
+
+        # get_chat_member() is a blocking HTTP call - run it off the event loop
+        # so it can never stall other requests.
+        allowed = await run_in_threadpool(
+            is_user_member, get_bot(), payload.telegram_user_id, REQUIRED_CHANNEL_ID
+        )
+        if not allowed:
+            logger.info("Chat request rejected: user %s is not a member", payload.telegram_user_id)
+            return forbidden
+
     history = [m.model_dump() for m in payload.history] if payload.history else None
 
     try:

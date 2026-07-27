@@ -39,9 +39,12 @@ from pydantic import BaseModel, Field, field_validator
 
 from ai_router import (
     DEFAULT_MAX_TOKENS,
+    DEFAULT_MODE,
     DEFAULT_SYSTEM_PROMPT,
     DEFAULT_TEMPERATURE,
+    available_modes,
     available_providers,
+    capability_router,
     smart_gemma_router,
     smart_gemma_router_verbose,
 )
@@ -268,6 +271,14 @@ class ChatRequest(BaseModel):
             "Raw, signed window.Telegram.WebApp.initData string. Verified server-side "
             "via HMAC-SHA256; required when force-subscribe is enabled."
         ),
+    )
+    mode: Optional[str] = Field(
+        default=None,
+        description="Capability: flash | reasoning | pro | core | vision. Defaults to core.",
+    )
+    images: Optional[List[str]] = Field(
+        default=None,
+        description="Base64 image strings (or data: URLs). Forces the vision engine.",
     )
 
     @field_validator("message")
@@ -500,6 +511,12 @@ async def check_membership(payload: MembershipRequest) -> Any:
     }
 
 
+@app.get("/api/modes", tags=["ai"])
+async def modes() -> Dict[str, Any]:
+    """List the capability map (flash / reasoning / pro / core / vision)."""
+    return {"success": True, "default": DEFAULT_MODE, "modes": available_modes()}
+
+
 @app.get("/api/providers", tags=["ai"])
 async def providers() -> Dict[str, Any]:
     """List the Gemma 3 fallback chain in priority order."""
@@ -578,13 +595,15 @@ async def chat(payload: ChatRequest) -> Any:
     history = [m.model_dump() for m in payload.history] if payload.history else None
 
     try:
-        result = smart_gemma_router_verbose(
+        result = await run_in_threadpool(
+            capability_router,
             payload.message,
-            system_prompt=payload.system_prompt or DEFAULT_SYSTEM_PROMPT,
-            history=history,
-            temperature=payload.temperature,
-            max_tokens=payload.max_tokens,
-            raise_on_failure=False,
+            payload.mode or DEFAULT_MODE,
+            payload.images,
+            payload.system_prompt or DEFAULT_SYSTEM_PROMPT,
+            history,
+            payload.temperature,
+            payload.max_tokens,
         )
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc

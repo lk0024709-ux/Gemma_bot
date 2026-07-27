@@ -51,6 +51,83 @@ GROQ_MODEL = os.getenv("GROQ_MODEL", "gemma-3-12b-it")
 OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "google/gemma-3-27b-it:free")
 HF_MODEL = os.getenv("HF_MODEL", "google/gemma-3-27b-it")
 
+# --------------------------------------------------------------------------- #
+# Capability map                                                               #
+# --------------------------------------------------------------------------- #
+# Each capability ("mode") pins a task type to the provider + model best suited
+# to it. Gemma 3 on Google AI Studio is the core/default engine and the only
+# multimodal one, so every mode ultimately falls back to `core`.
+
+CORE_MODE = "core"
+
+MODEL_MAP: Dict[str, Dict[str, Any]] = {
+    # High speed, low parameter count - snappy replies.
+    "flash": {
+        "provider": "groq",
+        "model": os.getenv("FLASH_MODEL", "llama-3.1-8b-instant"),
+        "label": "⚡ Flash",
+        "description": "Groq · Llama 3.1 8B — fastest replies",
+        "vision": False,
+    },
+    # Step-by-step logic / chain-of-thought.
+    "reasoning": {
+        "provider": "openrouter",
+        "model": os.getenv("REASONING_MODEL", "deepseek/deepseek-r1:free"),
+        "label": "🧩 Reasoning",
+        "description": "OpenRouter · DeepSeek-R1 — step-by-step logic",
+        "vision": False,
+    },
+    # Heavy coding / expert tasks.
+    "pro": {
+        "provider": "openrouter",
+        "model": os.getenv("PRO_MODEL", "meta-llama/llama-3.3-70b-instruct:free"),
+        "label": "🎓 Pro",
+        "description": "OpenRouter · Llama 3.3 70B — expert coding",
+        "vision": False,
+    },
+    # Balanced everyday engine - the default.
+    CORE_MODE: {
+        "provider": "google",
+        "model": os.getenv("CORE_MODEL", GOOGLE_MODEL),
+        "label": "🌐 Core",
+        "description": "Google AI Studio · Gemma 3 27B — balanced engine",
+        "vision": False,
+    },
+    # Multimodal: handles all image inputs.
+    "vision": {
+        "provider": "google",
+        "model": os.getenv("VISION_MODEL", "gemma-3-27b-it"),
+        "label": "👁 Vision",
+        "description": "Google AI Studio · Gemma 3 multimodal — image understanding",
+        "vision": True,
+    },
+}
+
+DEFAULT_MODE = CORE_MODE
+VISION_MODE = "vision"
+
+
+def normalise_mode(mode: Optional[str]) -> str:
+    """Coerce arbitrary user input to a known capability, defaulting to core."""
+    key = str(mode or "").strip().lower().lstrip("/")
+    return key if key in MODEL_MAP else DEFAULT_MODE
+
+
+def available_modes() -> List[Dict[str, Any]]:
+    """Describe every capability, including whether its provider key is set."""
+    return [
+        {
+            "mode": name,
+            "provider": spec["provider"],
+            "model": spec["model"],
+            "label": spec["label"],
+            "description": spec["description"],
+            "vision": spec["vision"],
+            "configured": bool(_provider_key(spec["provider"])),
+        }
+        for name, spec in MODEL_MAP.items()
+    ]
+
 # Endpoints
 GOOGLE_ENDPOINT = (
     "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
@@ -69,6 +146,8 @@ DEFAULT_SYSTEM_PROMPT = os.getenv(
 DEFAULT_TEMPERATURE = float(os.getenv("AI_TEMPERATURE", "0.7"))
 DEFAULT_MAX_TOKENS = int(os.getenv("AI_MAX_TOKENS", "1024"))
 REQUEST_TIMEOUT = int(os.getenv("AI_REQUEST_TIMEOUT", "60"))
+# Images make the request much heavier, so vision gets a longer budget.
+VISION_TIMEOUT = int(os.getenv("AI_VISION_TIMEOUT", "120"))
 MAX_RETRIES_PER_PROVIDER = int(os.getenv("AI_MAX_RETRIES", "2"))
 RETRY_BACKOFF_SECONDS = float(os.getenv("AI_RETRY_BACKOFF", "1.5"))
 
@@ -234,6 +313,25 @@ def _build_google_contents(
     return contents
 
 
+def _strip_data_url(data: str) -> str:
+    """Accept either a bare base64 string or a full ``data:`` URL."""
+    data = (data or "").strip()
+    if data.startswith("data:") and "," in data:
+        data = data.split(",", 1)[1]
+    return data.replace("\n", "").replace("\r", "")
+
+
+def _provider_key(provider: str) -> str:
+    """Return the configured API key for a provider name ('' when missing)."""
+    return {
+        "google": GOOGLE_API_KEY,
+        "google-vision": GOOGLE_API_KEY,
+        "groq": GROQ_API_KEY,
+        "openrouter": OPENROUTER_API_KEY,
+        "huggingface": HF_TOKEN,
+    }.get(provider, "")
+
+
 def _clean_output(text: str) -> str:
     """Strip stray Gemma control tokens that some providers echo back."""
     if not text:
@@ -311,10 +409,24 @@ def call_google_gemma(
     max_tokens: int = DEFAULT_MAX_TOKENS,
 ) -> str:
     """Call Google AI Studio's Generative Language API (``gemma-3-27b-it``)."""
+    return _call_google_model(
+        GOOGLE_MODEL, prompt, system_prompt, history, temperature, max_tokens
+    )
+
+
+def _call_google_model(
+    model: str,
+    prompt: str,
+    system_prompt: Optional[str] = None,
+    history: Optional[Sequence[Message]] = None,
+    temperature: float = DEFAULT_TEMPERATURE,
+    max_tokens: int = DEFAULT_MAX_TOKENS,
+) -> str:
+    """Text-only Google AI Studio call against an explicit Gemma 3 model id."""
     if not GOOGLE_API_KEY:
         raise ProviderError("google", "GOOGLE_API_KEY is not set")
 
-    url = GOOGLE_ENDPOINT.format(model=GOOGLE_MODEL)
+    url = GOOGLE_ENDPOINT.format(model=model)
     system_prompt = DEFAULT_SYSTEM_PROMPT if system_prompt is None else system_prompt
 
     # Gemma models on this API reject `systemInstruction`, so we inline it.
@@ -353,6 +465,88 @@ def call_google_gemma(
     text = _clean_output(text)
     if not text:
         raise ProviderError("google", "empty completion")
+    return text
+
+
+def call_google_vision(
+    prompt: str,
+    images: Sequence[Any],
+    system_prompt: Optional[str] = None,
+    history: Optional[Sequence[Message]] = None,
+    temperature: float = DEFAULT_TEMPERATURE,
+    max_tokens: int = DEFAULT_MAX_TOKENS,
+    model: Optional[str] = None,
+) -> str:
+    """Call Gemma 3 multimodal on Google AI Studio with one or more images.
+
+    ``images`` accepts either raw base64 strings or dicts shaped like
+    ``{"data": <base64>, "mime_type": "image/jpeg"}``. Each is emitted into the
+    ``parts`` array using Google's ``inlineData`` format::
+
+        {"inlineData": {"data": <base64>, "mimeType": "image/jpeg"}}
+    """
+    if not GOOGLE_API_KEY:
+        raise ProviderError("google-vision", "GOOGLE_API_KEY is not set")
+    if not images:
+        raise ProviderError("google-vision", "no image supplied")
+
+    target_model = model or MODEL_MAP[VISION_MODE]["model"]
+    system_prompt = DEFAULT_SYSTEM_PROMPT if system_prompt is None else system_prompt
+
+    # Prior turns stay text-only; the image rides on the final user turn.
+    contents = _build_google_contents(prompt or "Describe this image.", history)
+    final_parts = contents[-1]["parts"]
+
+    if system_prompt:
+        first = contents[0]["parts"][0]
+        first["text"] = f"{system_prompt}\n\n{first['text']}"
+
+    for image in images:
+        if isinstance(image, dict):
+            data = image.get("data") or image.get("base64") or ""
+            mime = image.get("mime_type") or image.get("mimeType") or "image/jpeg"
+        else:
+            data, mime = str(image), "image/jpeg"
+
+        data = _strip_data_url(data)
+        if not data:
+            continue
+        # Image first, then the question - Gemma attends better in this order.
+        final_parts.insert(0, {"inlineData": {"data": data, "mimeType": mime}})
+
+    if not any("inlineData" in part for part in final_parts):
+        raise ProviderError("google-vision", "no decodable image data")
+
+    payload = {
+        "contents": contents,
+        "generationConfig": {
+            "temperature": temperature,
+            "maxOutputTokens": max_tokens,
+            "topP": 0.95,
+            "topK": 64,
+        },
+    }
+
+    data = _post_json(
+        "google-vision",
+        GOOGLE_ENDPOINT.format(model=target_model),
+        headers={"Content-Type": "application/json", "x-goog-api-key": GOOGLE_API_KEY},
+        payload=payload,
+        timeout=VISION_TIMEOUT,
+    )
+
+    if isinstance(data, dict) and data.get("promptFeedback", {}).get("blockReason"):
+        raise ProviderError("google-vision", f"blocked: {data['promptFeedback']['blockReason']}")
+
+    try:
+        parts = data["candidates"][0]["content"]["parts"]
+        text = "".join(p.get("text", "") for p in parts)
+    except (KeyError, IndexError, TypeError) as exc:
+        raise ProviderError("google-vision", f"unexpected response shape: {exc}") from exc
+
+    text = _clean_output(text)
+    if not text:
+        raise ProviderError("google-vision", "empty completion")
     return text
 
 
@@ -539,6 +733,11 @@ FALLBACK_MESSAGE = (
     "Please check your API keys or try again in a moment."
 )
 
+VISION_FALLBACK_MESSAGE = (
+    "⚠️ The Gemma 3 vision engine is unavailable right now. "
+    "Please try sending the image again in a moment."
+)
+
 
 def available_providers() -> List[Dict[str, Any]]:
     """Return the provider chain with a boolean flag for configured API keys."""
@@ -599,6 +798,155 @@ def smart_gemma_router_verbose(
 
     return RouterResult(
         text=FALLBACK_MESSAGE,
+        provider="none",
+        model="none",
+        latency_ms=int((time.perf_counter() - started) * 1000),
+        errors=errors,
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Capability-based router                                                      #
+# --------------------------------------------------------------------------- #
+
+
+def _dispatch(
+    mode: str,
+    prompt: str,
+    system_prompt: Optional[str],
+    history: Optional[Sequence[Message]],
+    temperature: float,
+    max_tokens: int,
+    images: Optional[Sequence[Any]] = None,
+) -> str:
+    """Invoke the provider bound to ``mode``. Raises :class:`ProviderError`."""
+    spec = MODEL_MAP[mode]
+    provider, model = spec["provider"], spec["model"]
+
+    if not _provider_key(provider):
+        raise ProviderError(provider, f"API key for '{mode}' mode is not configured")
+
+    # Gemma 3 on Google AI Studio handles both core and vision.
+    if provider == "google":
+        if images:
+            return call_google_vision(
+                prompt, images, system_prompt, history, temperature, max_tokens, model=model
+            )
+        return _call_google_model(
+            model, prompt, system_prompt, history, temperature, max_tokens
+        )
+
+    if images:
+        raise ProviderError(provider, f"'{mode}' mode cannot process images")
+
+    if provider == "groq":
+        url, extra = GROQ_ENDPOINT, None
+    elif provider == "openrouter":
+        url = OPENROUTER_ENDPOINT
+        extra = {"HTTP-Referer": OPENROUTER_SITE_URL, "X-Title": OPENROUTER_APP_NAME}
+    else:
+        raise ProviderError(provider, f"unsupported provider for mode '{mode}'")
+
+    return _call_openai_compatible(
+        provider=provider,
+        url=url,
+        api_key=_provider_key(provider),
+        model=model,
+        prompt=prompt,
+        system_prompt=DEFAULT_SYSTEM_PROMPT if system_prompt is None else system_prompt,
+        history=history,
+        temperature=temperature,
+        max_tokens=max_tokens,
+        extra_headers=extra,
+    )
+
+
+def capability_router(
+    prompt: str,
+    mode: Optional[str] = None,
+    images: Optional[Sequence[Any]] = None,
+    system_prompt: Optional[str] = None,
+    history: Optional[Sequence[Message]] = None,
+    temperature: float = DEFAULT_TEMPERATURE,
+    max_tokens: int = DEFAULT_MAX_TOKENS,
+) -> RouterResult:
+    """Route a request to the capability that fits the task.
+
+    Resolution order:
+
+    1. Any request carrying ``images`` is forced to ``vision`` (Gemma 3
+       multimodal) regardless of the requested mode.
+    2. Otherwise the requested mode is used, defaulting to ``core``.
+    3. If that provider times out or errors, fall back to ``core`` (Gemma 3),
+       then to the legacy provider chain as a final safety net.
+
+    Never raises for provider outages - always returns a :class:`RouterResult`.
+    """
+    if not prompt and not images:
+        raise ValueError("prompt must be a non-empty string")
+
+    requested = normalise_mode(mode)
+    # Images can only be understood by the multimodal engine.
+    if images:
+        if requested != VISION_MODE:
+            logger.info("Images present - overriding mode '%s' with vision", requested)
+        requested = VISION_MODE
+
+    errors: Dict[str, str] = {}
+    started = time.perf_counter()
+
+    # Try the requested mode, then core as the universal fallback.
+    attempts = [requested] if requested == CORE_MODE else [requested, CORE_MODE]
+
+    for attempt_mode in attempts:
+        spec = MODEL_MAP[attempt_mode]
+        # Falling back to a text-only engine is pointless when images are present.
+        if images and not spec["vision"]:
+            continue
+
+        logger.info("Routing to '%s' (%s · %s)", attempt_mode, spec["provider"], spec["model"])
+        try:
+            text = _dispatch(
+                attempt_mode, prompt, system_prompt, history, temperature, max_tokens, images
+            )
+        except ProviderError as exc:
+            errors[attempt_mode] = str(exc)
+            logger.warning("Mode '%s' failed: %s", attempt_mode, exc)
+        except Exception as exc:  # noqa: BLE001 - one mode must not kill the request
+            errors[attempt_mode] = f"unexpected error: {exc}"
+            logger.exception("Unexpected error in mode '%s'", attempt_mode)
+        else:
+            return RouterResult(
+                text=text,
+                provider=f"{attempt_mode}:{spec['provider']}",
+                model=spec["model"],
+                latency_ms=int((time.perf_counter() - started) * 1000),
+                errors=errors,
+            )
+
+    # Text-only last resort: walk the original multi-provider chain.
+    if not images:
+        logger.warning("All capability modes failed - trying the legacy provider chain")
+        try:
+            result = smart_gemma_router_verbose(
+                prompt,
+                system_prompt=system_prompt,
+                history=history,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                raise_on_failure=False,
+            )
+        except Exception as exc:  # noqa: BLE001
+            errors["fallback_chain"] = str(exc)
+        else:
+            if result.provider != "none":
+                result.errors = {**errors, **result.errors}
+                return result
+            errors.update(result.errors)
+
+    logger.error("Capability routing failed for mode '%s': %s", requested, errors)
+    return RouterResult(
+        text=VISION_FALLBACK_MESSAGE if images else FALLBACK_MESSAGE,
         provider="none",
         model="none",
         latency_ms=int((time.perf_counter() - started) * 1000),

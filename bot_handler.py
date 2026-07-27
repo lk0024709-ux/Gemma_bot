@@ -17,6 +17,7 @@ Public API
 
 from __future__ import annotations
 
+import base64
 import logging
 import os
 import threading
@@ -26,7 +27,15 @@ from typing import Any, Deque, Dict, List, Optional
 
 from dotenv import load_dotenv
 
-from ai_router import DEFAULT_SYSTEM_PROMPT, smart_gemma_router_verbose
+from ai_router import (
+    CORE_MODE,
+    DEFAULT_MODE,
+    DEFAULT_SYSTEM_PROMPT,
+    MODEL_MAP,
+    VISION_MODE,
+    capability_router,
+    normalise_mode,
+)
 from tg_db import log_interaction
 
 load_dotenv()
@@ -88,9 +97,14 @@ WELCOME_TEXT = (
     "👋 *Gemma 3 Neuro-System online*\n\n"
     "Send me any message and I'll answer using the Gemma 3 model family "
     "with automatic multi-provider fallback.\n\n"
+    "*Modes*\n"
+    "/core - 🌐 Gemma 3 balanced engine (default)\n"
+    "/flash - ⚡ fastest replies\n"
+    "/reasoning - 🧩 step-by-step logic\n"
+    "/pro - 🎓 heavy coding & expert tasks\n"
+    "📷 Send a photo for Gemma 3 vision.\n\n"
     "*Commands*\n"
-    "/start - show this message\n"
-    "/help - usage help\n"
+    "/mode - show the active engine\n"
     "/reset - clear our conversation memory\n"
     "/status - show provider & bot status"
 )
@@ -99,6 +113,8 @@ HELP_TEXT = (
     "🧠 *How to use*\n\n"
     "Just type a question. I keep a short rolling memory of our chat so "
     "follow-ups work naturally.\n\n"
+    "Switch engines any time with /core, /flash, /reasoning or /pro, and send a "
+    "photo to use Gemma 3 vision. /mode shows what's active.\n\n"
     "Use /reset to wipe that memory, /status to see which AI provider is live."
 )
 
@@ -118,9 +134,16 @@ _conversations: Dict[int, Deque[Dict[str, str]]] = defaultdict(
     lambda: deque(maxlen=max(HISTORY_TURNS, 2))
 )
 
+# chat_id -> selected capability. Defaults to `core` (Gemma 3 balanced engine).
+user_task_mode: Dict[int, str] = defaultdict(lambda: DEFAULT_MODE)
+
+# Largest Telegram photo we will download and base64 into a Gemma 3 request.
+MAX_IMAGE_BYTES = int(os.getenv("MAX_IMAGE_BYTES", str(4 * 1024 * 1024)))  # 4 MB
+
 _stats: Dict[str, Any] = {
     "started_at": None,
     "messages_handled": 0,
+    "images_handled": 0,
     "errors": 0,
     "blocked": 0,  # requests rejected by the force-subscribe gate
     "last_provider": None,
@@ -131,6 +154,18 @@ _stats: Dict[str, Any] = {
 # --------------------------------------------------------------------------- #
 # Helpers                                                                      #
 # --------------------------------------------------------------------------- #
+
+
+def _guess_mime(path: str) -> str:
+    """Map a Telegram file path extension to an image MIME type."""
+    ext = (path.rsplit(".", 1)[-1] if "." in path else "").lower()
+    return {
+        "png": "image/png",
+        "webp": "image/webp",
+        "gif": "image/gif",
+        "heic": "image/heic",
+        "heif": "image/heif",
+    }.get(ext, "image/jpeg")
 
 
 def _chunk(text: str, limit: int = TELEGRAM_MSG_LIMIT) -> List[str]:
@@ -387,23 +422,72 @@ def create_bot() -> Optional["telebot.TeleBot"]:
         if not _guard(message):
             return
         _conversations.pop(message.chat.id, None)
-        _safe_reply(message, "🧹 Conversation memory cleared.")
+        user_task_mode[message.chat.id] = DEFAULT_MODE
+        _safe_reply(message, "🧹 Conversation memory cleared. Mode reset to 🌐 Core.")
+
+    # ---------------------- capability mode switches ---------------------- #
+
+    @bot.message_handler(commands=["core"])
+    def handle_core(message: Any) -> None:
+        if not _guard(message):
+            return
+        user_task_mode[message.chat.id] = CORE_MODE
+        _safe_reply(message, "🌐 Core Mode activated! (Gemma 3 Balanced Engine)")
+
+    @bot.message_handler(commands=["flash"])
+    def handle_flash(message: Any) -> None:
+        if not _guard(message):
+            return
+        user_task_mode[message.chat.id] = "flash"
+        _safe_reply(message, "⚡ Flash Mode activated! (Groq Llama 8B — instant replies)")
+
+    @bot.message_handler(commands=["reasoning"])
+    def handle_reasoning(message: Any) -> None:
+        if not _guard(message):
+            return
+        user_task_mode[message.chat.id] = "reasoning"
+        _safe_reply(message, "🧩 Reasoning Mode activated! (DeepSeek-R1 — step-by-step logic)")
+
+    @bot.message_handler(commands=["pro"])
+    def handle_pro(message: Any) -> None:
+        if not _guard(message):
+            return
+        user_task_mode[message.chat.id] = "pro"
+        _safe_reply(message, "🎓 Pro Mode activated! (Llama 70B — heavy coding & expert tasks)")
+
+    @bot.message_handler(commands=["mode"])
+    def handle_mode(message: Any) -> None:
+        """Show the active capability and everything available."""
+        if not _guard(message):
+            return
+        current = user_task_mode[message.chat.id]
+        lines = [f"🎛 *Current mode:* {MODEL_MAP[current]['label']}", ""]
+        for name, spec in MODEL_MAP.items():
+            if name == VISION_MODE:
+                continue  # automatic, not user-selectable
+            mark = "▶️" if name == current else "  "
+            lines.append(f"{mark} /{name} — {spec['description']}")
+        lines += ["", "📷 Send a photo and Gemma 3 vision handles it automatically."]
+        _safe_reply(message, "\n".join(lines))
 
     @bot.message_handler(commands=["status"])
     def handle_status(message: Any) -> None:
-        from ai_router import available_providers  # local import to avoid cycles
+        from ai_router import available_modes  # local import to avoid cycles
 
-        lines = ["📊 *Neuro-System status*", ""]
-        for provider in available_providers():
-            mark = "✅" if provider["configured"] else "⛔"
-            lines.append(f"{mark} `{provider['name']}` - {provider['model']}")
+        current = user_task_mode[message.chat.id]
+        lines = ["📊 *Neuro-System status*", "", "*Capabilities*"]
+        for spec in available_modes():
+            mark = "✅" if spec["configured"] else "⛔"
+            arrow = " ◀️" if spec["mode"] == current else ""
+            lines.append(f"{mark} `{spec['mode']}` — {spec['model']}{arrow}")
         lines += [
             "",
             f"Force-subscribe: {'on - ' + REQUIRED_CHANNEL_ID if force_sub_enabled() else 'off'}",
             f"Messages handled: {_stats['messages_handled']}",
+            f"Images handled: {_stats['images_handled']}",
             f"Blocked (not a member): {_stats['blocked']}",
             f"Errors: {_stats['errors']}",
-            f"Last provider used: {_stats['last_provider'] or 'n/a'}",
+            f"Last engine used: {_stats['last_provider'] or 'n/a'}",
         ]
         _safe_reply(message, "\n".join(lines))
 
@@ -450,11 +534,11 @@ def create_bot() -> Optional["telebot.TeleBot"]:
             pass
 
         try:
-            result = smart_gemma_router_verbose(
+            result = capability_router(
                 prompt,
+                mode=user_task_mode[chat_id],
                 system_prompt=DEFAULT_SYSTEM_PROMPT,
                 history=_history_for(chat_id),
-                raise_on_failure=False,
             )
             answer, provider = result.text, result.provider
             _stats["last_provider"] = provider
@@ -470,13 +554,92 @@ def create_bot() -> Optional["telebot.TeleBot"]:
         _safe_reply(message, answer)
         _archive(message, prompt, answer, provider)
 
+    @bot.message_handler(content_types=["photo"])
+    def handle_photo(message: Any) -> None:
+        """Send a photo to the Gemma 3 vision engine (Google AI Studio)."""
+        chat_id = message.chat.id
+        if not _guard(message):
+            return
+
+        try:
+            bot.send_chat_action(chat_id, "typing")
+        except Exception:  # noqa: BLE001
+            pass
+
+        # message.photo is ordered smallest -> largest; take the biggest that
+        # still fits our size budget so we don't blow up the request payload.
+        try:
+            candidates = [p for p in message.photo if (p.file_size or 0) <= MAX_IMAGE_BYTES]
+            photo = candidates[-1] if candidates else message.photo[0]
+            file_info = bot.get_file(photo.file_id)
+            raw = bot.download_file(file_info.file_path)
+        except Exception as exc:  # noqa: BLE001
+            _stats["errors"] += 1
+            logger.error("Could not download the photo: %s", exc)
+            _safe_reply(message, "⚠️ I couldn't download that image. Please try again.")
+            return
+
+        if len(raw) > MAX_IMAGE_BYTES:
+            _safe_reply(
+                message,
+                f"🖼 That image is too large (max {MAX_IMAGE_BYTES // (1024 * 1024)} MB). "
+                "Please send a smaller one.",
+            )
+            return
+
+        image_b64 = base64.b64encode(raw).decode("ascii")
+        mime = _guess_mime(getattr(file_info, "file_path", "") or "")
+        prompt = (message.caption or "").strip() or "Describe this image in detail."
+
+        try:
+            result = capability_router(
+                prompt,
+                mode=VISION_MODE,
+                images=[{"data": image_b64, "mime_type": mime}],
+                system_prompt=DEFAULT_SYSTEM_PROMPT,
+                history=_history_for(chat_id),
+            )
+            answer, provider = result.text, result.provider
+            _stats["last_provider"] = provider
+            _stats["images_handled"] += 1
+        except Exception as exc:  # noqa: BLE001
+            _stats["errors"] += 1
+            logger.exception("Vision request failed: %s", exc)
+            _safe_reply(message, "⚠️ Something went wrong analysing that image.")
+            return
+
+        # Keep the transcript coherent without storing the raw image bytes.
+        _remember(chat_id, "user", f"[image] {prompt}")
+        _remember(chat_id, "assistant", answer)
+        _safe_reply(message, answer)
+        _archive(message, f"[image] {prompt}", answer, provider)
+
     @bot.message_handler(
-        content_types=["photo", "document", "audio", "voice", "video", "sticker"]
+        content_types=["document", "audio", "voice", "video", "sticker"]
     )
     def handle_unsupported(message: Any) -> None:
         if not _guard(message):
             return
-        _safe_reply(message, "📎 I can only process text messages right now.")
+        _safe_reply(
+            message,
+            "📎 I can handle text and photos. Send an image and I'll analyse it with "
+            "Gemma 3 vision.",
+        )
+
+    # Populate the in-app command menu (best effort - never fatal).
+    try:
+        bot.set_my_commands([
+            telebot.types.BotCommand("core", "🌐 Gemma 3 balanced engine (default)"),
+            telebot.types.BotCommand("flash", "⚡ Fastest replies"),
+            telebot.types.BotCommand("reasoning", "🧩 Step-by-step logic"),
+            telebot.types.BotCommand("pro", "🎓 Heavy coding & expert tasks"),
+            telebot.types.BotCommand("mode", "Show the active engine"),
+            telebot.types.BotCommand("reset", "Clear conversation memory"),
+            telebot.types.BotCommand("status", "Provider & bot status"),
+            telebot.types.BotCommand("help", "Usage help"),
+        ])
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("set_my_commands failed (safe to ignore): %s", exc)
 
     logger.info("Telegram bot handlers registered")
     return bot
@@ -606,6 +769,7 @@ def get_bot_status() -> Dict[str, Any]:
         "running": bool(_bot_thread and _bot_thread.is_alive() and _stats["running"]),
         "uptime_seconds": uptime,
         "messages_handled": _stats["messages_handled"],
+        "images_handled": _stats["images_handled"],
         "blocked": _stats["blocked"],
         "errors": _stats["errors"],
         "last_provider": _stats["last_provider"],

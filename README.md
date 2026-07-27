@@ -139,7 +139,7 @@ Optional fields: `history` (`[{"role":"user","content":"…"}]`), `system_prompt
 | `GET`  | `/` | The web dashboard (`frontend/index.html`) |
 | `GET`  | `/api` | Service banner (JSON) |
 | `GET`  | `/api/config` | Public client config (force-subscribe, invite link) |
-| `GET`  | `/api/membership/{id}` | Re-check a user's channel membership |
+| `POST` | `/api/membership` | Re-check the authenticated user's membership |
 | `GET`  | `/health` | Providers + bot + channel health |
 | `GET`  | `/api/providers` | Fallback chain and key configuration |
 | `POST` | `/api/memory` | Store an arbitrary JSON record in the channel |
@@ -165,7 +165,8 @@ Behaviour:
 - **Bot** — non-members get `🔒 Access Denied! Please join our channel to use this AI.`
   plus a *Join Channel* button and an *I've Joined* button that re-verifies instantly.
   The AI router is never called for them.
-- **API** — `POST /api/chat` requires `telegram_user_id`. Non-members get **403**:
+- **API** — `POST /api/chat` requires a signed `tg_init_data` (see below).
+  Non-members get **403**:
   ```json
   { "error": "FORBIDDEN_NOT_MEMBER", "invite_link": "https://t.me/mychannel" }
   ```
@@ -175,8 +176,8 @@ Behaviour:
 
 ## Telegram Mini App
 
-`frontend/` loads the official `telegram-web-app.js` SDK, calls `tg.ready()`, reads
-the user id from `tg.initDataUnsafe.user.id` and sends it as `telegram_user_id`.
+`frontend/` loads the official `telegram-web-app.js` SDK, calls `tg.ready()`, and
+sends the **signed** `tg.initData` string as `tg_init_data` on every request.
 The CSS maps `--tg-theme-*` variables onto the palette, so the UI matches the
 user's light/dark theme automatically — and falls back to the built-in dark theme
 when opened in a plain browser.
@@ -184,10 +185,34 @@ when opened in a plain browser.
 To register it: **@BotFather → /newapp** (or *Bot Settings → Menu Button*) and point
 it at your Render URL.
 
-> **Security note:** `initDataUnsafe` is, as the name says, unverified — a crafted
-> request can claim any `telegram_user_id`. It's fine as a "join the channel" nudge,
-> but for real authorisation validate the signed `initData` HMAC server-side with
-> your bot token before trusting the id.
+### Anti-spoofing: signed `initData` (HMAC-SHA256)
+
+The API never trusts a client-supplied user id. The Mini App sends the **raw signed**
+`window.Telegram.WebApp.initData` string as `tg_init_data`, and
+`verify_tg_web_app_data()` in `main.py` validates it using Telegram's official
+algorithm:
+
+```
+secret_key = HMAC_SHA256(key="WebAppData", msg=bot_token)
+signature  = HMAC_SHA256(key=secret_key, msg=data_check_string)
+```
+
+where `data_check_string` is every field except `hash`, sorted alphabetically and
+joined with `\n`. The comparison uses `hmac.compare_digest` (constant-time).
+Only the `user.id` **inside the verified payload** is passed to the channel gate,
+so `curl -d '{"telegram_user_id": 12345}'` no longer gets you anything.
+
+| Condition | Response |
+|-----------|----------|
+| Missing / forged / tampered `tg_init_data` | `401 {"error": "UNAUTHORIZED_SPOOFING_DETECTED"}` |
+| Valid signature, but not in the channel | `403 {"error": "FORBIDDEN_NOT_MEMBER", ...}` |
+| Valid signature + channel member | `200` with the AI answer |
+
+Replay protection: payloads older than `INIT_DATA_MAX_AGE` (default 24h) are rejected.
+`initDataUnsafe` is still read for cosmetics but is **never** sent to the server.
+
+> For local UI work outside Telegram set `ALLOW_UNVERIFIED_TMA=true` **with no bot
+> token configured**. Never enable it in production — it disables anti-spoofing.
 
 ## Using the modules directly
 

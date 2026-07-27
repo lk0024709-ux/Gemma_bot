@@ -17,9 +17,13 @@ Run locally::
 
 from __future__ import annotations
 
+import hashlib
+import hmac
+import json
 import logging
 import os
 import time
+import urllib.parse
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -77,6 +81,18 @@ CHANNEL_INVITE_LINK = os.getenv("CHANNEL_INVITE_LINK", "").strip()
 if not CHANNEL_INVITE_LINK and REQUIRED_CHANNEL_ID.startswith("@"):
     CHANNEL_INVITE_LINK = f"https://t.me/{REQUIRED_CHANNEL_ID.lstrip('@')}"
 
+# --------------------------------------------------------------------------- #
+# Telegram Mini App initData validation                                        #
+# --------------------------------------------------------------------------- #
+# Reject initData older than this many seconds, which stops a leaked payload
+# from being replayed forever. Set to 0 to disable the freshness check.
+INIT_DATA_MAX_AGE = int(os.getenv("INIT_DATA_MAX_AGE", "86400"))  # 24h
+
+# When no bot token is configured we cannot verify signatures at all. Refusing
+# to run the gate open is the safe choice, but it would break local frontend
+# development, so it is opt-in.
+ALLOW_UNVERIFIED_TMA = os.getenv("ALLOW_UNVERIFIED_TMA", "false").lower() in ("1", "true", "yes")
+
 _STARTED_AT = time.time()
 
 # --------------------------------------------------------------------------- #
@@ -118,6 +134,116 @@ else:
 
 
 # --------------------------------------------------------------------------- #
+# Telegram WebApp HMAC-SHA256 validation                                       #
+# --------------------------------------------------------------------------- #
+
+
+def verify_tg_web_app_data(init_data: str, bot_token: str) -> Optional[Dict[str, Any]]:
+    """Validate a Telegram Mini App ``initData`` string and return its payload.
+
+    Implements Telegram's official algorithm
+    (https://core.telegram.org/bots/webapps#validating-data-received-via-the-mini-app):
+
+    1. Parse the URL-encoded query string.
+    2. Pop the ``hash`` field.
+    3. Build ``data_check_string``: remaining ``key=value`` pairs sorted
+       alphabetically by key and joined with ``\\n``.
+    4. ``secret_key = HMAC_SHA256(key="WebAppData", msg=bot_token)``.
+    5. ``signature  = HMAC_SHA256(key=secret_key, msg=data_check_string)``.
+    6. Constant-time compare against the received ``hash``.
+
+    Returns
+    -------
+    dict | None
+        The parsed fields on success, with the ``user`` JSON string already
+        decoded into a dict (plus a convenience ``user_id`` key). ``None`` if
+        the signature is missing, malformed, forged or expired.
+
+    Notes
+    -----
+    Never raises - any malformed input simply yields ``None``.
+    """
+    if not init_data or not isinstance(init_data, str):
+        logger.debug("initData validation failed: empty payload")
+        return None
+    if not bot_token:
+        logger.error("initData validation failed: TELEGRAM_BOT_TOKEN is not configured")
+        return None
+
+    try:
+        # keep_blank_values so empty fields still take part in the check string.
+        parsed = urllib.parse.parse_qsl(init_data, keep_blank_values=True, strict_parsing=True)
+    except ValueError as exc:
+        logger.debug("initData validation failed: unparsable query string (%s)", exc)
+        return None
+
+    # Duplicate keys would make the check string ambiguous -> reject.
+    keys = [k for k, _ in parsed]
+    if len(keys) != len(set(keys)):
+        logger.warning("initData validation failed: duplicate keys in payload")
+        return None
+
+    data = dict(parsed)
+    received_hash = data.pop("hash", "")
+    if not received_hash:
+        logger.debug("initData validation failed: no hash field")
+        return None
+
+    # Step 3 - alphabetically sorted "key=value" lines.
+    data_check_string = "\n".join(f"{key}={data[key]}" for key in sorted(data))
+
+    # Step 4/5 - derive the secret key, then sign the check string.
+    secret_key = hmac.new(b"WebAppData", bot_token.encode("utf-8"), hashlib.sha256).digest()
+    computed_hash = hmac.new(
+        secret_key, data_check_string.encode("utf-8"), hashlib.sha256
+    ).hexdigest()
+
+    # Step 6 - constant-time comparison defeats timing attacks.
+    if not hmac.compare_digest(computed_hash, received_hash):
+        logger.warning("initData validation failed: signature mismatch (possible spoofing)")
+        return None
+
+    # Optional replay protection: reject stale payloads.
+    if INIT_DATA_MAX_AGE > 0:
+        try:
+            auth_date = int(data.get("auth_date", "0"))
+        except (TypeError, ValueError):
+            auth_date = 0
+        if auth_date <= 0:
+            logger.warning("initData validation failed: missing/invalid auth_date")
+            return None
+        age = time.time() - auth_date
+        if age > INIT_DATA_MAX_AGE:
+            logger.warning("initData validation failed: payload is %.0fs old (expired)", age)
+            return None
+
+    # Signature is valid - decode the nested JSON fields.
+    result: Dict[str, Any] = dict(data)
+    for field in ("user", "receiver", "chat"):
+        raw = result.get(field)
+        if isinstance(raw, str) and raw:
+            try:
+                result[field] = json.loads(raw)
+            except ValueError:
+                logger.warning("initData: %s field is not valid JSON", field)
+                if field == "user":
+                    return None
+
+    user = result.get("user")
+    if not isinstance(user, dict) or user.get("id") is None:
+        logger.warning("initData validation failed: no usable user object")
+        return None
+
+    try:
+        result["user_id"] = int(user["id"])
+    except (TypeError, ValueError):
+        logger.warning("initData validation failed: user.id is not an integer")
+        return None
+
+    return result
+
+
+# --------------------------------------------------------------------------- #
 # Schemas                                                                      #
 # --------------------------------------------------------------------------- #
 
@@ -136,9 +262,12 @@ class ChatRequest(BaseModel):
     temperature: float = Field(default=DEFAULT_TEMPERATURE, ge=0.0, le=2.0)
     max_tokens: int = Field(default=DEFAULT_MAX_TOKENS, ge=1, le=8192)
     user_id: Optional[str] = Field(default=None, description="Client identifier for logging")
-    telegram_user_id: Optional[int] = Field(
+    tg_init_data: Optional[str] = Field(
         default=None,
-        description="Telegram user id from the Mini App; required when force-subscribe is on",
+        description=(
+            "Raw, signed window.Telegram.WebApp.initData string. Verified server-side "
+            "via HMAC-SHA256; required when force-subscribe is enabled."
+        ),
     )
 
     @field_validator("message")
@@ -157,6 +286,12 @@ class ChatResponse(BaseModel):
     latency_ms: int
     memory_id: Optional[int] = None
     timestamp: str
+
+
+class MembershipRequest(BaseModel):
+    tg_init_data: Optional[str] = Field(
+        default=None, description="Raw signed window.Telegram.WebApp.initData string"
+    )
 
 
 class MemoryRequest(BaseModel):
@@ -323,18 +458,39 @@ async def client_config() -> Dict[str, Any]:
     }
 
 
-@app.get("/api/membership/{telegram_user_id}", tags=["telegram"])
-async def check_membership(telegram_user_id: int) -> Dict[str, Any]:
-    """Check whether a Telegram user has joined the required channel.
+@app.post("/api/membership", tags=["telegram"])
+async def check_membership(payload: MembershipRequest) -> Any:
+    """Check whether the *authenticated* user has joined the required channel.
 
     Used by the Mini App's "I've joined, re-check" button so the user doesn't
     have to send a throwaway message to find out.
+
+    Takes the signed ``initData`` rather than a bare user id - otherwise anyone
+    could enumerate the membership status of arbitrary Telegram accounts.
     """
     if not force_sub_enabled():
         return {"success": True, "is_member": True, "force_subscribe": False}
 
+    if not TELEGRAM_BOT_TOKEN and ALLOW_UNVERIFIED_TMA:
+        return {"success": True, "is_member": True, "force_subscribe": True, "unverified": True}
+
+    verified = await run_in_threadpool(
+        verify_tg_web_app_data, payload.tg_init_data or "", TELEGRAM_BOT_TOKEN
+    )
+    if not verified:
+        return JSONResponse(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            content={
+                "error": "UNAUTHORIZED_SPOOFING_DETECTED",
+                "message": (
+                    "Could not verify your Telegram identity. "
+                    "Please open this app from inside Telegram."
+                ),
+            },
+        )
+
     is_member = await run_in_threadpool(
-        is_user_member, get_bot(), telegram_user_id, REQUIRED_CHANNEL_ID, False
+        is_user_member, get_bot(), verified["user_id"], REQUIRED_CHANNEL_ID, False
     )
     return {
         "success": True,
@@ -363,30 +519,61 @@ async def chat(payload: ChatRequest) -> Any:
     ``temperature``, ``max_tokens``) and returns Gemma 3's answer together with
     the provider that served it.
     """
-    # --- Force-subscribe gate -------------------------------------------- #
-    # Runs before any AI call so non-members never consume provider quota.
+    # --- Gate 1: cryptographic identity (anti-spoofing) ------------------- #
+    # The client can claim anything, so the only trustworthy user id is the one
+    # inside a payload signed with our bot token.
+    verified_user_id: Optional[int] = None
+
     if force_sub_enabled():
-        forbidden = JSONResponse(
-            status_code=status.HTTP_403_FORBIDDEN,
+        unauthorized = JSONResponse(
+            status_code=status.HTTP_401_UNAUTHORIZED,
             content={
-                "error": "FORBIDDEN_NOT_MEMBER",
-                "invite_link": CHANNEL_INVITE_LINK,
-                "message": "🔒 Access Denied! Please join our channel to use this AI.",
+                "error": "UNAUTHORIZED_SPOOFING_DETECTED",
+                "message": (
+                    "Could not verify your Telegram identity. "
+                    "Please open this app from inside Telegram."
+                ),
             },
         )
 
-        if payload.telegram_user_id is None:
-            logger.info("Chat request rejected: no telegram_user_id supplied")
-            return forbidden
+        if not TELEGRAM_BOT_TOKEN:
+            if not ALLOW_UNVERIFIED_TMA:
+                logger.error("Cannot verify initData: TELEGRAM_BOT_TOKEN is not set")
+                return unauthorized
+            logger.warning("ALLOW_UNVERIFIED_TMA is on - skipping initData verification")
+        else:
+            if not payload.tg_init_data:
+                logger.info("Chat request rejected: no tg_init_data supplied")
+                return unauthorized
 
+            # HMAC over a short string is fast, but keep the event loop clean.
+            verified = await run_in_threadpool(
+                verify_tg_web_app_data, payload.tg_init_data, TELEGRAM_BOT_TOKEN
+            )
+            if not verified:
+                logger.warning("Chat request rejected: initData failed HMAC validation")
+                return unauthorized
+
+            verified_user_id = verified["user_id"]
+
+    # --- Gate 2: force-subscribe channel membership ----------------------- #
+    # Runs before any AI call so non-members never consume provider quota.
+    if force_sub_enabled() and verified_user_id is not None:
         # get_chat_member() is a blocking HTTP call - run it off the event loop
         # so it can never stall other requests.
         allowed = await run_in_threadpool(
-            is_user_member, get_bot(), payload.telegram_user_id, REQUIRED_CHANNEL_ID
+            is_user_member, get_bot(), verified_user_id, REQUIRED_CHANNEL_ID
         )
         if not allowed:
-            logger.info("Chat request rejected: user %s is not a member", payload.telegram_user_id)
-            return forbidden
+            logger.info("Chat request rejected: user %s is not a member", verified_user_id)
+            return JSONResponse(
+                status_code=status.HTTP_403_FORBIDDEN,
+                content={
+                    "error": "FORBIDDEN_NOT_MEMBER",
+                    "invite_link": CHANNEL_INVITE_LINK,
+                    "message": "🔒 Access Denied! Please join our channel to use this AI.",
+                },
+            )
 
     history = [m.model_dump() for m in payload.history] if payload.history else None
 

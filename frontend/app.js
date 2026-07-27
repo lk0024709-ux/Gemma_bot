@@ -12,7 +12,7 @@
     health: "/health",
     providers: "/api/providers",
     config: "/api/config",
-    membership: (id) => `/api/membership/${id}`,
+    membership: "/api/membership",
   };
   const HISTORY_LIMIT = 10;      // messages sent back as context
   const HEALTH_POLL_MS = 60_000; // refresh sidebar every minute
@@ -23,19 +23,29 @@
   // the CDN script loaded). Everything below degrades gracefully in a browser.
   const tg = window.Telegram?.WebApp || null;
   const inTelegram = Boolean(tg && tg.initData !== undefined && tg.platform !== "unknown");
-  let tgUserId = null;
+
+  // The SIGNED payload. This is the only thing the backend trusts: it verifies
+  // the HMAC-SHA256 signature with the bot token before reading the user id.
+  // `initDataUnsafe` is never sent anywhere - it is client-side data that
+  // anyone could forge, so we only use it for cosmetic purposes.
+  let rawInitData = "";
+  let tgUserId = null; // display/telemetry only, NEVER used for authorisation
   let inviteLink = "";
 
   if (tg) {
     try {
       tg.ready();
       tg.expand?.();
+      rawInitData = tg.initData || "";
       tgUserId = tg.initDataUnsafe?.user?.id ?? null;
       if (inTelegram) document.body.classList.add("tma");
     } catch (err) {
       console.warn("Telegram WebApp init failed:", err);
     }
   }
+
+  /** True when we hold a signed payload the server can actually verify. */
+  const hasSignedIdentity = () => Boolean(rawInitData);
 
   /** Open a t.me link via Telegram when available, else a normal new tab. */
   function openChannel(link) {
@@ -214,7 +224,8 @@
       temperature: parseFloat(els.temperature.value),
       max_tokens: parseInt(els.maxTokens.value, 10) || 1024,
     };
-    if (tgUserId != null) payload.telegram_user_id = tgUserId;
+    // Send the signed blob, not the spoofable user id.
+    if (rawInitData) payload.tg_init_data = rawInitData;
     if (els.useHistory.checked && history.length) {
       payload.history = history.slice(-HISTORY_LIMIT);
     }
@@ -238,6 +249,14 @@
       }
 
       typing.remove();
+
+      // --- Identity could not be verified (spoofing / outside Telegram) --- //
+      if (res.status === 401 && data && data.error === "UNAUTHORIZED_SPOOFING_DETECTED") {
+        haptic("error");
+        showAuthError(data.message);
+        els.modelLine.textContent = "Unauthorized";
+        return;
+      }
 
       // --- Force-subscribe: user has not joined the channel --------------- //
       if (res.status === 403 && data && data.error === "FORBIDDEN_NOT_MEMBER") {
@@ -288,6 +307,25 @@
     }
   }
 
+  // ------------------------------------------------------ auth / identity
+  /**
+   * The server could not verify our Telegram signature. Almost always this
+   * means the page was opened in a normal browser instead of inside Telegram
+   * (or the initData has expired), so explain that rather than showing a
+   * cryptic error.
+   */
+  function showAuthError(message) {
+    const detail =
+      message || "Could not verify your Telegram identity.";
+    const advice = inTelegram
+      ? "Your session may have expired — please close and reopen the app from the bot."
+      : "This app must be opened from inside Telegram. Open your bot and tap the menu button to launch it.";
+
+    addMessage("assistant", `🚫 ${detail}\n\n${advice}`, { error: true });
+    showGate(`${detail} ${advice}`);
+    els.gateRecheck.hidden = !hasSignedIdentity();
+  }
+
   // ------------------------------------------------------ force-subscribe
   /** Render the "join the channel" message inside the chat transcript. */
   function showJoinPrompt(message) {
@@ -314,7 +352,7 @@
 
     body.append(who, content);
 
-    if (!tgUserId && !inTelegram) {
+    if (!hasSignedIdentity() && !inTelegram) {
       const note = document.createElement("div");
       note.className = "meta";
       note.textContent =
@@ -354,7 +392,7 @@
 
   /** Ask the backend to re-verify membership (after the user joins). */
   async function recheckMembership(btn) {
-    if (tgUserId == null) {
+    if (!hasSignedIdentity()) {
       showGate("Open this Mini App from Telegram so we can verify your membership.");
       return;
     }
@@ -364,8 +402,19 @@
       btn.textContent = "Checking…";
     }
     try {
-      const res = await fetch(API.membership(tgUserId), { cache: "no-store" });
+      const res = await fetch(API.membership, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ tg_init_data: rawInitData }),
+        cache: "no-store",
+      });
       const data = await res.json();
+      if (res.status === 401) {
+        haptic("error");
+        setGateHint("Telegram identity could not be verified. Reopen the app from the bot.", "err");
+        if (btn) btn.textContent = original || "✅ I've joined";
+        return;
+      }
       if (data.is_member) {
         haptic("success");
         hideGate();
@@ -423,21 +472,33 @@
     inviteLink = cfg.invite_link || "";
     if (!cfg.force_subscribe) return; // gate disabled server-side
 
-    if (tgUserId == null) {
+    if (!hasSignedIdentity()) {
       // Opened outside Telegram (or initData unavailable): explain, don't block
       // silently. The server still enforces the rule on every request.
       showGate(
         inTelegram
-          ? "We couldn't read your Telegram account. Please reopen the app from the bot."
-          : "This app must be opened from inside Telegram so we can verify your channel membership."
+          ? "We couldn't read your Telegram session. Please reopen the app from the bot."
+          : "This app must be opened from inside Telegram so we can verify your identity."
       );
-      els.gateRecheck.hidden = !inTelegram;
+      els.gateRecheck.hidden = true; // nothing to re-check without a signature
       return;
     }
 
     try {
-      const res = await fetch(API.membership(tgUserId), { cache: "no-store" });
+      const res = await fetch(API.membership, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ tg_init_data: rawInitData }),
+        cache: "no-store",
+      });
       const data = await res.json();
+      if (res.status === 401) {
+        showGate(
+          "Your Telegram session could not be verified. Please close and reopen the app from the bot."
+        );
+        els.gateRecheck.hidden = false;
+        return;
+      }
       if (!data.is_member) {
         showGate("Please join our channel to use this AI.");
       }

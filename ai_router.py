@@ -64,9 +64,9 @@ MODEL_MAP: Dict[str, Dict[str, Any]] = {
     # High speed, low parameter count - snappy replies.
     "flash": {
         "provider": "groq",
-        "model": os.getenv("FLASH_MODEL", "llama-3.1-8b-instant"),
+        "model": os.getenv("FLASH_MODEL", "openai/gpt-oss-20b"),
         "label": "⚡ Flash",
-        "description": "Groq · Llama 3.1 8B — fastest replies",
+        "description": "Groq · GPT-OSS 20B — fastest replies (~1000 t/s)",
         "vision": False,
     },
     # Step-by-step logic / chain-of-thought.
@@ -111,6 +111,29 @@ def normalise_mode(mode: Optional[str]) -> str:
     """Coerce arbitrary user input to a known capability, defaulting to core."""
     key = str(mode or "").strip().lower().lstrip("/")
     return key if key in MODEL_MAP else DEFAULT_MODE
+
+
+# Model ids that providers have retired. Warned about at startup so a dead
+# capability surfaces at boot instead of mid-conversation.
+KNOWN_DEPRECATED: Dict[str, str] = {
+    "meta-llama/llama-4-scout-17b-16e-instruct": "Groq shut this down 2026-07-17; use openai/gpt-oss-20b",
+    "llama-4-scout": "not a valid Groq model id; use openai/gpt-oss-20b",
+    "meta-llama/llama-4-maverick-17b-128e-instruct": "Groq shut this down 2026-03-09",
+    "qwen/qwen3-32b": "Groq shut this down 2026-07-17",
+    "llama-3.1-8b-instant": "Groq deprecation: shutdown 2026-08-16; use openai/gpt-oss-20b",
+    "llama-3.3-70b-versatile": "Groq deprecation: shutdown 2026-08-16",
+    "deepseek/deepseek-r1:free": "OpenRouter retired the DeepSeek :free tier; drop ':free'",
+}
+
+
+def check_model_health() -> List[str]:
+    """Return human-readable warnings for retired/invalid model ids."""
+    warnings: List[str] = []
+    for mode, spec in MODEL_MAP.items():
+        note = KNOWN_DEPRECATED.get(spec["model"])
+        if note:
+            warnings.append(f"'{mode}' -> {spec['model']}: {note}")
+    return warnings
 
 
 def available_modes() -> List[Dict[str, Any]]:

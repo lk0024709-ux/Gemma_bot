@@ -44,6 +44,7 @@ from ai_router import (
     DEFAULT_TEMPERATURE,
     available_modes,
     available_providers,
+    check_model_health,
     capability_router,
     smart_gemma_router,
     smart_gemma_router_verbose,
@@ -330,6 +331,14 @@ async def lifespan(app: FastAPI):
     else:
         logger.warning("  frontend     %s not found - UI disabled, API still up", INDEX_FILE)
     logger.info("  cors         %s", ", ".join(CORS_ORIGINS))
+    for spec in available_modes():
+        logger.info(
+            "  mode %-10s %-42s %s",
+            spec["mode"], spec["model"],
+            "configured" if spec["configured"] else "MISSING KEY",
+        )
+    for warning in check_model_health():
+        logger.warning("  DEPRECATED MODEL  %s", warning)
     if force_sub_enabled():
         logger.info("  force-sub    ON - users must join %s", REQUIRED_CHANNEL_ID)
         if not CHANNEL_INVITE_LINK:

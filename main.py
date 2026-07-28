@@ -17,6 +17,7 @@ Run locally::
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import hmac
 import json
@@ -45,6 +46,10 @@ from ai_router import (
     available_modes,
     available_providers,
     check_model_health,
+    generate_image,
+    image_enabled,
+    key_pool_health,
+    parse_image_flags,
     capability_router,
     smart_gemma_router,
     smart_gemma_router_verbose,
@@ -337,8 +342,21 @@ async def lifespan(app: FastAPI):
             spec["mode"], spec["model"],
             "configured" if spec["configured"] else "MISSING KEY",
         )
+    health = key_pool_health()
+    for name, pool in health["pools"].items():
+        logger.info(
+            "  keys %-11s %s/%s active  -> %s",
+            name, pool["active"], pool["total"], ", ".join(pool["modes"]),
+        )
+    img = health["image"]
+    logger.info(
+        "  image        github_flux=%s hf_flux=%s (%s)",
+        "on" if img["github_flux"]["configured"] else "off",
+        "on" if img["hf_flux"]["configured"] else "off",
+        "enabled" if img["enabled"] else "DISABLED",
+    )
     for warning in check_model_health():
-        logger.warning("  DEPRECATED MODEL  %s", warning)
+        logger.warning("  HEALTH  %s", warning)
     if force_sub_enabled():
         logger.info("  force-sub    ON - users must join %s", REQUIRED_CHANNEL_ID)
         if not CHANNEL_INVITE_LINK:
@@ -448,6 +466,8 @@ async def health(deep: bool = False) -> Dict[str, Any]:
         "status": "healthy" if any(p["configured"] for p in providers) else "degraded",
         "uptime_seconds": int(time.time() - _STARTED_AT),
         "providers": providers,
+        "modes": available_modes(),
+        "keys": key_pool_health(),
         "frontend": FRONTEND_AVAILABLE,
         "telegram_bot": get_bot_status(),
         "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -517,6 +537,59 @@ async def check_membership(payload: MembershipRequest) -> Any:
         "is_member": bool(is_member),
         "force_subscribe": True,
         "invite_link": CHANNEL_INVITE_LINK,
+    }
+
+
+class ImageGenRequest(BaseModel):
+    prompt: str = Field(..., description="Prompt; may include --ratio/--style/--dev/--seed flags")
+    ratio: Optional[str] = Field(default=None, description="1:1 | 16:9 | 9:16 | 4:3 | 3:4")
+    style: Optional[str] = Field(
+        default=None, description="photorealistic | cinematic | anime | digital-art | 3d-render"
+    )
+    dev: bool = Field(default=False, description="Use Flux.1-dev instead of Flux.1-schnell")
+    seed: Optional[int] = Field(default=None, description="Reproducible seed")
+    tg_init_data: Optional[str] = Field(default=None)
+
+
+@app.post("/api/image", tags=["image"])
+async def create_image(payload: ImageGenRequest) -> Any:
+    """Generate an image with the dedicated Flux pipeline (GitHub -> HF)."""
+    if not image_enabled():
+        raise HTTPException(
+            status_code=503,
+            detail="Image generation is not configured (set GITHUB_IMAGE_TOKEN or HF_TOKEN)",
+        )
+
+    req = parse_image_flags(payload.prompt)
+    # Explicit JSON fields win over inline flags.
+    if payload.ratio:
+        req.ratio = payload.ratio
+    if payload.style:
+        req.style = payload.style
+    if payload.dev:
+        req.use_dev = True
+    if payload.seed is not None:
+        req.seed = payload.seed
+    if not req.prompt:
+        raise HTTPException(status_code=422, detail="prompt must not be empty")
+
+    result = await run_in_threadpool(generate_image, req)
+    if not result.ok:
+        raise HTTPException(status_code=502, detail={"error": "IMAGE_FAILED", "engines": result.errors})
+
+    width, height = req.size
+    return {
+        "success": True,
+        "image_base64": base64.b64encode(result.image_bytes).decode("ascii"),
+        "engine": result.engine,
+        "model": result.model,
+        "width": width,
+        "height": height,
+        "ratio": req.ratio,
+        "style": req.style,
+        "seed": req.seed,
+        "latency_ms": result.latency_ms,
+        "warnings": req.warnings,
     }
 
 

@@ -28,13 +28,19 @@ from typing import Any, Deque, Dict, List, Optional
 from dotenv import load_dotenv
 
 from ai_router import (
+    ASPECT_RATIOS,
     CORE_MODE,
     DEFAULT_MODE,
     DEFAULT_SYSTEM_PROMPT,
+    IMAGE_FALLBACK_MESSAGE,
     MODEL_MAP,
+    STYLE_MODIFIERS,
     VISION_MODE,
     capability_router,
+    generate_image,
+    image_enabled,
     normalise_mode,
+    parse_image_flags,
 )
 from tg_db import log_interaction
 
@@ -104,9 +110,22 @@ WELCOME_TEXT = (
     "/pro - 🎓 heavy coding & expert tasks\n"
     "📷 Send a photo for Gemma 3 vision.\n\n"
     "*Commands*\n"
+    "/image - 🎨 generate an image with Flux\n"
     "/mode - show the active engine\n"
     "/reset - clear our conversation memory\n"
     "/status - show provider & bot status"
+)
+
+IMAGE_USAGE_TEXT = (
+    "🎨 *Image generation* (Flux)\n\n"
+    "`/image a fox in a snowy forest`\n\n"
+    "*Flags*\n"
+    "`--ratio` / `-r` — 1:1, 16:9, 9:16, 4:3, 3:4\n"
+    "`--style` / `-s` — photorealistic, cinematic, anime, digital-art, 3d-render\n"
+    "`--dev` — use Flux.1-dev (slower, higher quality)\n"
+    "`--seed 1234` — reproducible output\n\n"
+    "*Example*\n"
+    "`/image neon tokyo alley -r 16:9 -s cinematic --seed 42`"
 )
 
 HELP_TEXT = (
@@ -115,6 +134,8 @@ HELP_TEXT = (
     "follow-ups work naturally.\n\n"
     "Switch engines any time with /core, /flash, /reasoning or /pro, and send a "
     "photo to use Gemma 3 vision. /mode shows what's active.\n\n"
+    "🎨 /image <prompt> generates pictures with Flux - supports --ratio, --style, "
+    "--dev and --seed. Send /image on its own for the full flag list.\n\n"
     "Use /reset to wipe that memory, /status to see which AI provider is live."
 )
 
@@ -144,6 +165,7 @@ _stats: Dict[str, Any] = {
     "started_at": None,
     "messages_handled": 0,
     "images_handled": 0,
+    "images_generated": 0,
     "errors": 0,
     "blocked": 0,  # requests rejected by the force-subscribe gate
     "last_provider": None,
@@ -455,6 +477,76 @@ def create_bot() -> Optional["telebot.TeleBot"]:
         user_task_mode[message.chat.id] = "pro"
         _safe_reply(message, "🎓 Pro Mode activated! (Llama 70B — heavy coding & expert tasks)")
 
+    @bot.message_handler(commands=["image", "imagine"])
+    def handle_image(message: Any) -> None:
+        """Generate an image with the dedicated Flux pipeline."""
+        if not _guard(message):
+            return
+
+        chat_id = message.chat.id
+        # Strip the leading /image or /imagine (and any @botname suffix).
+        raw = (message.text or "")
+        argument = raw.split(maxsplit=1)[1] if len(raw.split(maxsplit=1)) > 1 else ""
+
+        if not image_enabled():
+            _safe_reply(
+                message,
+                "🚫 Image generation is not configured. Set `GITHUB_IMAGE_TOKEN` "
+                "(primary) or `HF_TOKEN` (backup).",
+            )
+            return
+
+        req = parse_image_flags(argument)
+        if not req.prompt:
+            _safe_reply(message, IMAGE_USAGE_TEXT)
+            return
+
+        try:
+            bot.send_chat_action(chat_id, "upload_photo")
+        except Exception:  # noqa: BLE001
+            pass
+
+        notes = "\n".join(f"⚠️ {w}" for w in req.warnings)
+        status = (
+            f"🎨 Generating *{req.ratio}*"
+            f"{' · ' + req.style if req.style else ''}"
+            f"{' · dev' if req.use_dev else ''}…"
+        )
+        _safe_reply(message, f"{status}\n{notes}".strip())
+
+        result = generate_image(req)
+
+        if not result.ok:
+            _stats["errors"] += 1
+            detail = "; ".join(f"{k}: {v}" for k, v in result.errors.items())
+            logger.error("Image generation failed: %s", detail)
+            _safe_reply(message, IMAGE_FALLBACK_MESSAGE)
+            return
+
+        _stats["images_generated"] += 1
+        width, height = req.size
+        caption = (
+            f"🖼 `{req.prompt[:180]}`\n"
+            f"{width}×{height} · {req.ratio}"
+            f"{' · ' + req.style if req.style else ''}"
+            f"{' · seed ' + str(req.seed) if req.seed is not None else ''}\n"
+            f"engine: {result.engine} · {result.latency_ms} ms"
+        )
+        try:
+            bot.send_photo(
+                chat_id, result.image_bytes, caption=caption[:1024], parse_mode="Markdown"
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("send_photo failed (%s) - retrying as a document", exc)
+            try:
+                bot.send_document(chat_id, result.image_bytes, visible_file_name="flux.png")
+            except Exception as inner:  # noqa: BLE001
+                logger.error("Could not deliver the generated image: %s", inner)
+                _safe_reply(message, "⚠️ The image was generated but could not be sent.")
+                return
+
+        _archive(message, f"[image] {req.prompt}", f"<image via {result.engine}>", result.engine)
+
     @bot.message_handler(commands=["mode"])
     def handle_mode(message: Any) -> None:
         """Show the active capability and everything available."""
@@ -633,6 +725,7 @@ def create_bot() -> Optional["telebot.TeleBot"]:
             telebot.types.BotCommand("flash", "⚡ Fastest replies"),
             telebot.types.BotCommand("reasoning", "🧩 Step-by-step logic"),
             telebot.types.BotCommand("pro", "🎓 Heavy coding & expert tasks"),
+            telebot.types.BotCommand("image", "🎨 Generate an image (Flux)"),
             telebot.types.BotCommand("mode", "Show the active engine"),
             telebot.types.BotCommand("reset", "Clear conversation memory"),
             telebot.types.BotCommand("status", "Provider & bot status"),
@@ -770,6 +863,7 @@ def get_bot_status() -> Dict[str, Any]:
         "uptime_seconds": uptime,
         "messages_handled": _stats["messages_handled"],
         "images_handled": _stats["images_handled"],
+        "images_generated": _stats["images_generated"],
         "blocked": _stats["blocked"],
         "errors": _stats["errors"],
         "last_provider": _stats["last_provider"],

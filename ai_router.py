@@ -44,6 +44,8 @@ GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY", "").strip()
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "").strip()
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "").strip()
 HF_TOKEN = os.getenv("HF_TOKEN", "").strip()
+# GitHub Models (Azure AI inference) - authenticates with a GitHub PAT.
+GITHUB_TOKEN = os.getenv("GITHUB_TOKEN", "").strip()
 
 # Model IDs (overridable via env so you can chase whatever endpoint is live).
 GOOGLE_MODEL = os.getenv("GOOGLE_MODEL", "gemma-3-27b-it")
@@ -64,25 +66,25 @@ MODEL_MAP: Dict[str, Dict[str, Any]] = {
     # High speed, low parameter count - snappy replies.
     "flash": {
         "provider": "groq",
-        "model": os.getenv("FLASH_MODEL", "openai/gpt-oss-20b"),
+        "model": os.getenv("FLASH_MODEL", "llama-3.3-70b-versatile"),
         "label": "⚡ Flash",
-        "description": "Groq · GPT-OSS 20B — fastest replies (~1000 t/s)",
+        "description": "Groq · Llama 3.3 70B Versatile — fast replies",
         "vision": False,
     },
-    # Step-by-step logic / chain-of-thought.
+    # Step-by-step logic / chain-of-thought, via GitHub Models (Azure).
     "reasoning": {
-        "provider": "openrouter",
-        "model": os.getenv("REASONING_MODEL", "deepseek/deepseek-r1:free"),
+        "provider": "github",
+        "model": os.getenv("REASONING_MODEL", "DeepSeek-R1"),
         "label": "🧩 Reasoning",
-        "description": "OpenRouter · DeepSeek-R1 — step-by-step logic",
+        "description": "GitHub Models · DeepSeek-R1 — step-by-step logic",
         "vision": False,
     },
     # Heavy coding / expert tasks.
     "pro": {
         "provider": "openrouter",
-        "model": os.getenv("PRO_MODEL", "meta-llama/llama-3.3-70b-instruct:free"),
+        "model": os.getenv("PRO_MODEL", "meta-llama/llama-4-maverick"),
         "label": "🎓 Pro",
-        "description": "OpenRouter · Llama 3.3 70B — expert coding",
+        "description": "OpenRouter · Llama 4 Maverick — expert coding",
         "vision": False,
     },
     # Balanced everyday engine - the default.
@@ -121,18 +123,62 @@ KNOWN_DEPRECATED: Dict[str, str] = {
     "meta-llama/llama-4-maverick-17b-128e-instruct": "Groq shut this down 2026-03-09",
     "qwen/qwen3-32b": "Groq shut this down 2026-07-17",
     "llama-3.1-8b-instant": "Groq deprecation: shutdown 2026-08-16; use openai/gpt-oss-20b",
-    "llama-3.3-70b-versatile": "Groq deprecation: shutdown 2026-08-16",
+    "llama-3.3-70b-versatile": (
+        "Groq deprecation: shutdown 2026-08-16; use openai/gpt-oss-20b (fast) "
+        "or openai/gpt-oss-120b"
+    ),
     "deepseek/deepseek-r1:free": "OpenRouter retired the DeepSeek :free tier; drop ':free'",
+    "meta-llama/llama-3.3-70b-instruct:free": (
+        "OpenRouter free Llama tiers are unreliable; drop ':free' if requests 404"
+    ),
+}
+
+
+# Human-readable env var name for each provider, used in health warnings.
+PROVIDER_KEY_NAMES: Dict[str, str] = {
+    "google": "GOOGLE_API_KEY",
+    "google-vision": "GOOGLE_API_KEY",
+    "groq": "GROQ_API_KEY",
+    "openrouter": "OPENROUTER_API_KEY",
+    "github": "GITHUB_TOKEN",
+    "huggingface": "HF_TOKEN",
 }
 
 
 def check_model_health() -> List[str]:
-    """Return human-readable warnings for retired/invalid model ids."""
+    """Warn about retired/invalid model ids and missing provider credentials.
+
+    Covers every key the capability map depends on - ``GOOGLE_API_KEY``,
+    ``GROQ_API_KEY``, ``OPENROUTER_API_KEY`` and ``GITHUB_TOKEN`` - so a
+    misconfigured mode is visible at startup rather than at first use.
+    """
     warnings: List[str] = []
+
     for mode, spec in MODEL_MAP.items():
         note = KNOWN_DEPRECATED.get(spec["model"])
         if note:
             warnings.append(f"'{mode}' -> {spec['model']}: {note}")
+
+    # Report each missing credential once, listing the modes it disables.
+    missing: Dict[str, List[str]] = {}
+    for mode, spec in MODEL_MAP.items():
+        provider = spec["provider"]
+        if not _provider_key(provider):
+            env_name = PROVIDER_KEY_NAMES.get(provider, provider.upper())
+            missing.setdefault(env_name, []).append(mode)
+
+    for env_name, modes in sorted(missing.items()):
+        warnings.append(
+            f"{env_name} is not set - mode(s) {', '.join(sorted(modes))} "
+            f"will fall back to '{CORE_MODE}'"
+        )
+
+    if not _provider_key("google"):
+        warnings.append(
+            "GOOGLE_API_KEY is not set - the 'core' fallback engine is unavailable, "
+            "so failures cannot be absorbed"
+        )
+
     return warnings
 
 
@@ -157,6 +203,10 @@ GOOGLE_ENDPOINT = (
 )
 GROQ_ENDPOINT = "https://api.groq.com/openai/v1/chat/completions"
 OPENROUTER_ENDPOINT = "https://openrouter.ai/api/v1/chat/completions"
+# GitHub Models is OpenAI-compatible and served via Azure AI inference.
+GITHUB_MODELS_ENDPOINT = os.getenv(
+    "GITHUB_MODELS_ENDPOINT", "https://models.inference.ai.azure.com/chat/completions"
+)
 HF_ENDPOINT = "https://api-inference.huggingface.co/models/{model}"
 
 # Generation defaults
@@ -352,6 +402,7 @@ def _provider_key(provider: str) -> str:
         "groq": GROQ_API_KEY,
         "openrouter": OPENROUTER_API_KEY,
         "huggingface": HF_TOKEN,
+        "github": GITHUB_TOKEN,
     }.get(provider, "")
 
 
@@ -867,6 +918,11 @@ def _dispatch(
     elif provider == "openrouter":
         url = OPENROUTER_ENDPOINT
         extra = {"HTTP-Referer": OPENROUTER_SITE_URL, "X-Title": OPENROUTER_APP_NAME}
+    elif provider == "github":
+        # GitHub Models is OpenAI-compatible; auth is `Bearer <GITHUB_TOKEN>`,
+        # which _call_openai_compatible() already sets from the api_key.
+        url = GITHUB_MODELS_ENDPOINT
+        extra = {"api-key": _provider_key(provider)}
     else:
         raise ProviderError(provider, f"unsupported provider for mode '{mode}'")
 

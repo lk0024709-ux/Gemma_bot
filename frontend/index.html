@@ -1,0 +1,133 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta name="description" content="Gemma 3 Neuro-System — multi-provider AI dashboard" />
+  <meta name="color-scheme" content="dark" />
+  <title>Gemma 3 Neuro-System</title>
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🧠</text></svg>" />
+  <!-- Telegram Mini App SDK: must load before app.js so window.Telegram exists -->
+  <script src="https://telegram.org/js/telegram-web-app.js"></script>
+  <link rel="stylesheet" href="/style.css" />
+</head>
+<body>
+  <div class="app">
+    <!-- ==================== Sidebar ==================== -->
+    <aside class="sidebar" id="sidebar">
+      <div class="brand">
+        <div class="brand-mark">🧠</div>
+        <div class="brand-text">
+          <h1>Neuro-System</h1>
+          <span>Gemma 3 · Multi-API</span>
+        </div>
+      </div>
+
+      <section class="panel">
+        <h2 class="panel-title">System</h2>
+        <div class="stat">
+          <span class="stat-label">Status</span>
+          <span class="stat-value"><span class="dot" id="statusDot"></span><span id="statusText">checking…</span></span>
+        </div>
+        <div class="stat">
+          <span class="stat-label">Uptime</span>
+          <span class="stat-value" id="uptime">—</span>
+        </div>
+        <div class="stat">
+          <span class="stat-label">Telegram bot</span>
+          <span class="stat-value" id="botStatus">—</span>
+        </div>
+        <div class="stat">
+          <span class="stat-label">Last provider</span>
+          <span class="stat-value" id="lastProvider">—</span>
+        </div>
+      </section>
+
+      <section class="panel">
+        <h2 class="panel-title">Fallback chain</h2>
+        <ul class="providers" id="providerList">
+          <li class="provider skeleton"><span></span></li>
+          <li class="provider skeleton"><span></span></li>
+          <li class="provider skeleton"><span></span></li>
+          <li class="provider skeleton"><span></span></li>
+        </ul>
+      </section>
+
+      <section class="panel">
+        <h2 class="panel-title">Settings</h2>
+        <label class="field">
+          <span>Temperature <b id="tempValue">0.7</b></span>
+          <input type="range" id="temperature" min="0" max="2" step="0.1" value="0.7" />
+        </label>
+        <label class="field">
+          <span>Max tokens</span>
+          <input type="number" id="maxTokens" min="64" max="8192" step="64" value="1024" />
+        </label>
+        <label class="checkbox">
+          <input type="checkbox" id="useHistory" checked />
+          <span>Send conversation history</span>
+        </label>
+      </section>
+
+      <button class="btn-ghost" id="clearBtn" type="button">🧹 Clear conversation</button>
+      <footer class="sidebar-foot">
+        <a href="/docs" target="_blank" rel="noopener">API docs</a>
+        <span>·</span>
+        <a href="/health" target="_blank" rel="noopener">Health</a>
+      </footer>
+    </aside>
+
+    <!-- ==================== Chat ==================== -->
+    <main class="chat">
+      <header class="chat-head">
+        <button class="icon-btn" id="menuBtn" type="button" aria-label="Toggle sidebar">☰</button>
+        <div>
+          <h2>Chat</h2>
+          <p id="modelLine">Ready</p>
+        </div>
+        <span class="badge" id="providerBadge" hidden></span>
+      </header>
+
+      <div class="messages" id="messages" aria-live="polite">
+        <div class="welcome" id="welcome">
+          <div class="welcome-icon">🧠</div>
+          <h3>Gemma 3 Neuro-System</h3>
+          <p>Multi-provider AI with automatic fallback across Google&nbsp;AI&nbsp;Studio, Groq, OpenRouter and Hugging&nbsp;Face.</p>
+          <div class="suggestions">
+            <button class="chip" type="button">Explain quantum entanglement simply</button>
+            <button class="chip" type="button">Write a Python retry decorator</button>
+            <button class="chip" type="button">Ideas for a weekend project</button>
+            <button class="chip" type="button">Summarise the CAP theorem</button>
+          </div>
+        </div>
+      </div>
+
+      <div class="composer">
+        <div class="composer-inner">
+          <textarea id="input" rows="1" placeholder="Send a message…  (Enter to send, Shift+Enter for a new line)" autocomplete="off"></textarea>
+          <button id="sendBtn" class="btn-send" type="button" aria-label="Send">
+            <svg viewBox="0 0 24 24" width="20" height="20" aria-hidden="true">
+              <path fill="currentColor" d="M3.4 20.4l17.45-7.48a1 1 0 000-1.84L3.4 3.6a.993.993 0 00-1.39.91L2 9.12c0 .5.37.93.87.99L17 12 2.87 13.88c-.5.07-.87.5-.87 1l.01 4.61c0 .71.73 1.2 1.39.91z"/>
+            </svg>
+          </button>
+        </div>
+        <p class="composer-hint">Responses are generated by Gemma 3 and may be inaccurate.</p>
+      </div>
+    </main>
+  </div>
+
+  <!-- ============ Force-subscribe gate (shown when not a member) ============ -->
+  <div class="gate" id="gate" hidden>
+    <div class="gate-card">
+      <div class="gate-icon">🔒</div>
+      <h2>Access Denied</h2>
+      <p id="gateText">Please join our channel to use this AI.</p>
+      <a class="btn-primary" id="gateJoin" href="#" target="_blank" rel="noopener">📢 Join Channel</a>
+      <button class="btn-ghost" id="gateRecheck" type="button">✅ I've joined — check again</button>
+      <p class="gate-hint" id="gateHint"></p>
+    </div>
+  </div>
+
+  <script src="/app.js"></script>
+</body>
+</html>

@@ -32,6 +32,8 @@ except Exception:
 
 # Import AI router (keeps existing app logic)
 from ai_router import smart_gemma_router
+# Import fallback helper
+from ai_fallback import generate_response, FallbackError
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -203,6 +205,9 @@ async def chat_endpoint(request: ChatRequest):
 
     # --- Step 5: AI / LLM logic -----------------------------------
     prompt = request.message if request.message else "Hello!"
+
+    # Primary: existing smart_gemma_router. If it fails for any reason, fall
+    # back to the multi-provider generator implemented in ai_fallback.generate_response.
     try:
         ai_reply = await smart_gemma_router(
             prompt,
@@ -210,8 +215,13 @@ async def chat_endpoint(request: ChatRequest):
             chat_id=verified_user_id,
             user_id=verified_user_id,
         )
-    except Exception:
-        ai_reply = f"Hello, Telegram user {verified_user_id}! (API Fallback) This is a stub reply."
+    except Exception as e:
+        logger.exception("Primary LLM (smart_gemma_router) failed: %s", e)
+        try:
+            ai_reply = await generate_response(prompt)
+        except FallbackError as fe:
+            logger.exception("All fallback providers failed: %s", fe)
+            ai_reply = f"Hello, Telegram user {verified_user_id}! (All AI providers failed) This is a stub reply."
 
     return ChatResponse(reply=ai_reply, user_id=verified_user_id)
 

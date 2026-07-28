@@ -6,7 +6,7 @@ Features:
 - /chat POST endpoint that reuses the same AI router and security checks.
 - Background Telegram bot running in a daemon thread (python-telegram-bot v13 style).
 Environment variables required:
-  - TELEGRAM_TOKEN
+  - TELEGRAM_BOT_TOKEN or TELEGRAM_TOKEN
   - OPENAI_API_KEY
   - CURRENT_MODEL (optional; default used if missing)
 Run:
@@ -109,9 +109,10 @@ def echo_or_ai(update: Update, context: CallbackContext):
 
 # --- 3. BACKGROUND THREADING LOGIC ---
 def run_telegram_bot():
-    token = os.environ.get("TELEGRAM_TOKEN")
+    # Robust token fetching: check common env var names.
+    token = os.environ.get("TELEGRAM_BOT_TOKEN") or os.environ.get("TELEGRAM_TOKEN")
     if not token:
-        logger.error("TELEGRAM_TOKEN environment variable is required")
+        logger.error("Telegram bot token not found. Please set TELEGRAM_BOT_TOKEN or TELEGRAM_TOKEN environment variable.")
         return
 
     updater = Updater(token=token, use_context=True)
@@ -132,7 +133,9 @@ def run_telegram_bot():
 
     logger.info("Starting Telegram Bot polling...")
     updater.start_polling()
-    updater.idle()
+    # Removed updater.idle() to avoid signal registration in a non-main thread (ValueError).
+    # The polling loop runs fine in a background daemon thread without idle().
+
 
 # Launch bot on FastAPI startup in background thread
 @app.on_event("startup")

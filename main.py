@@ -226,7 +226,14 @@ def _run_telegram_bot() -> None:
         register_handlers(application)
 
         logger.info("Starting Telegram Bot polling...")
-        application.run_polling(drop_pending_updates=True)
+        # stop_signals=None: this runs in a background (non-main) thread, where
+        # asyncio signal handlers cannot be registered ("set_wakeup_fd only
+        # works in main thread"). Uvicorn handles shutdown signals in the main
+        # thread; this daemon thread exits with the process.
+        application.run_polling(
+            drop_pending_updates=True,
+            stop_signals=None,
+        )
 
     except Exception:
         logger.exception("Telegram bot crashed")

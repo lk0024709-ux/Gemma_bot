@@ -1,55 +1,55 @@
-"""Tests for Hugging Face image endpoint routing."""
+"""Tests for Pollinations image endpoint routing."""
 
-import os
 import unittest
 from unittest.mock import MagicMock, patch
+
+import requests
 
 from ai_fallback import IRAProviderError
 from ai_router import generate_image_router
 
 
 class GenerateImageRouterTests(unittest.TestCase):
-    def setUp(self):
-        self.environment = patch.dict(os.environ, {"HF_TOKEN": "test-token"}, clear=True)
-        self.environment.start()
-        self.addCleanup(self.environment.stop)
+    @patch("ai_router.requests.get")
+    def test_calls_pollinations_with_encoded_prompt(self, get):
+        get.return_value = MagicMock(status_code=200, content=b"image")
 
-    @patch("ai_router.requests.post")
-    def test_uses_flux_dev_endpoint_first(self, post):
-        post.return_value = MagicMock(status_code=200, content=b"image")
-
-        self.assertEqual(generate_image_router("a mountain"), b"image")
-
-        post.assert_called_once_with(
-            "https://api-inference.huggingface.co/models/black-forest-labs/FLUX.1-dev",
-            headers={"Authorization": "Bearer test-token"},
-            json={"inputs": "a mountain"},
-            timeout=60,
-        )
-
-    @patch("ai_router.requests.post")
-    def test_falls_back_to_stable_diffusion_when_flux_fails(self, post):
-        post.side_effect = [
-            MagicMock(status_code=410, text="deprecated"),
-            MagicMock(status_code=200, content=b"fallback-image"),
-        ]
-
-        self.assertEqual(generate_image_router("a mountain"), b"fallback-image")
-        self.assertEqual(post.call_count, 2)
         self.assertEqual(
-            post.call_args_list[1].args[0],
-            "https://api-inference.huggingface.co/models/"
-            "stabilityai/stable-diffusion-3.5-large",
+            generate_image_router("a red fox & a blue moon"), b"image"
         )
 
-    @patch("ai_router.requests.post")
-    def test_raises_provider_error_after_both_endpoints_fail(self, post):
-        post.side_effect = [
-            MagicMock(status_code=410, text="deprecated"),
-            MagicMock(status_code=503, text="busy"),
-        ]
+        get.assert_called_once()
+        called_url = get.call_args.args[0]
+        self.assertTrue(
+            called_url.startswith("https://image.pollinations.ai/prompt/")
+        )
+        # The prompt segment must be fully URL-encoded: no raw spaces or '&'.
+        prompt_segment = called_url[len("https://image.pollinations.ai/prompt/"):]
+        self.assertNotIn(" ", prompt_segment)
+        self.assertNotIn("&", prompt_segment)
+        self.assertIn("%20", prompt_segment)  # encoded spaces
+        self.assertIn("%26", prompt_segment)  # encoded '&'
+        # A timeout must be supplied so the call cannot hang forever.
+        self.assertEqual(get.call_args.kwargs.get("timeout"), 60)
 
-        with self.assertRaisesRegex(IRAProviderError, "503.*busy"):
+    @patch("ai_router.requests.get")
+    def test_returns_image_bytes_on_success(self, get):
+        get.return_value = MagicMock(status_code=200, content=b"jpeg-bytes")
+
+        self.assertEqual(generate_image_router("a mountain"), b"jpeg-bytes")
+
+    @patch("ai_router.requests.get")
+    def test_raises_provider_error_on_http_error(self, get):
+        get.return_value = MagicMock(status_code=502, text="bad gateway")
+
+        with self.assertRaisesRegex(IRAProviderError, "502"):
+            generate_image_router("a mountain")
+
+    @patch("ai_router.requests.get")
+    def test_raises_provider_error_on_network_error(self, get):
+        get.side_effect = requests.ConnectionError("boom")
+
+        with self.assertRaisesRegex(IRAProviderError, "network error"):
             generate_image_router("a mountain")
 
 

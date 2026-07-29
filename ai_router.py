@@ -8,12 +8,9 @@ This is the single entry point that bot_handler.py calls to generate responses.
 """
 
 import logging
+import os
+import requests
 from typing import Optional
-
-# New imports for fast in-memory image generation
-from huggingface_hub import InferenceClient
-from PIL import Image
-import io
 
 from ai_fallback import (
     call_groq,
@@ -120,81 +117,52 @@ def route_text(prompt: str, mode: str, system_prompt: str = "") -> str:
 
 def generate_image_router(prompt: str) -> bytes:
     """
-    Fast in-memory image generation using Hugging Face InferenceClient.
+    Direct HTTP POST to Hugging Face Serverless Endpoint for FLUX.1-schnell.
 
-    Uses provider="auto" and model "black-forest-labs/FLUX.1-schnell".
-
-    Important: This function does NOT write any files to disk.
-    It converts the returned image (PIL.Image or raw bytes) into PNG bytes
-    via io.BytesIO and returns the bytes.
+    Uses direct REST API calls (no SDK) to avoid third-party provider routing.
+    Returns image bytes directly from the API response.
 
     Args:
         prompt: The user's image description.
 
     Returns:
-        PNG image bytes.
+        Image bytes (binary content, typically PNG or JPEG).
 
     Raises:
-        IRAProviderError if inference returns an unexpected result or fails.
+        ValueError if HF_TOKEN environment variable is missing.
+        IRAProviderError if API request fails or returns an error.
     """
-    model_ref = "black-forest-labs/FLUX.1-schnell"
+    token = os.environ.get("HF_TOKEN")
+    if not token:
+        raise ValueError("HF_TOKEN environment variable is missing!")
+
+    api_url = "https://router.huggingface.co/hf-inference/models/black-forest-labs/FLUX.1-schnell"
+    headers = {"Authorization": f"Bearer {token}"}
+    payload = {"inputs": prompt}
 
     try:
-        client = InferenceClient(model=model_ref, provider="auto")
+        logger.info(f"Calling HF Serverless API for prompt: {prompt[:50]}...")
+        response = requests.post(
+            api_url,
+            headers=headers,
+            json=payload,
+            timeout=60
+        )
+
+        if response.status_code != 200:
+            error_msg = f"HF API Error ({response.status_code}): {response.text}"
+            logger.error(error_msg)
+            raise IRAProviderError(error_msg)
+
+        logger.info(f"✅ Image generated successfully ({len(response.content)} bytes)")
+        return response.content
+
+    except requests.RequestException as exc:
+        logger.exception("Network error during HF API call")
+        raise IRAProviderError(f"Network error: {str(exc)}") from exc
     except Exception as exc:
-        logger.exception("Failed to create InferenceClient")
-        raise IRAProviderError(f"InferenceClient initialization failed: {exc}") from exc
-
-    try:
-        # Use the text_to_image convenience method which typically returns raw bytes.
-        # Different HF backends may return bytes, a PIL.Image, or structured dicts.
-        response = client.text_to_image(prompt=prompt)
-
-        # If we received raw bytes already (PNG/JPEG), try to load via PIL and re-encode to PNG bytes.
-        if isinstance(response, (bytes, bytearray)):
-            try:
-                img = Image.open(io.BytesIO(response))
-                out = io.BytesIO()
-                img.save(out, format="PNG")
-                return out.getvalue()
-            except Exception:
-                # As a fallback, return raw bytes if PIL cannot parse (still in-memory, no disk usage).
-                return bytes(response)
-
-        # If a PIL image object was returned
-        if isinstance(response, Image.Image):
-            out = io.BytesIO()
-            response.save(out, format="PNG")
-            return out.getvalue()
-
-        # If it's a dict or other structure, attempt to extract base64 payloads
-        if isinstance(response, dict):
-            # Common keys: "image" (base64), "data" (list with b64_json), etc.
-            import base64
-
-            if "image" in response and isinstance(response["image"], str):
-                data = base64.b64decode(response["image"])
-                img = Image.open(io.BytesIO(data))
-                out = io.BytesIO()
-                img.save(out, format="PNG")
-                return out.getvalue()
-
-            if "data" in response and isinstance(response["data"], list):
-                for item in response["data"]:
-                    if isinstance(item, dict) and "b64_json" in item:
-                        data = base64.b64decode(item["b64_json"])
-                        img = Image.open(io.BytesIO(data))
-                        out = io.BytesIO()
-                        img.save(out, format="PNG")
-                        return out.getvalue()
-
-        # If none of the above matched, raise an error
-        raise IRAProviderError(f"Unexpected HF InferenceClient response type: {type(response)}")
-
-    except Exception as exc:
-        logger.exception("Hugging Face inference failed for prompt: %s", prompt)
-        # Wrap in IRAProviderError so callers can handle provider-specific failures.
-        raise IRAProviderError(str(exc)) from exc
+        logger.exception("Unexpected error during image generation")
+        raise IRAProviderError(f"Unexpected error: {str(exc)}") from exc
 
 
 def route_image(prompt: str) -> bytes:
@@ -202,8 +170,9 @@ def route_image(prompt: str) -> bytes:
     Route an image generation request.
 
     Kept for backward compatibility: delegates to generate_image_router.
+    Falls back to ai_fallback.call_hf_flux on failure.
     """
-    # Prefer the new fast in-memory router
+    # Prefer the new direct HTTP router
     try:
         return generate_image_router(prompt)
     except IRAProviderError:

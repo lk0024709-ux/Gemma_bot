@@ -122,7 +122,7 @@ def generate_image_router(prompt: str) -> bytes:
     """
     Fast in-memory image generation using Hugging Face InferenceClient.
 
-    Uses provider="auto" and model "black-forest-labs/FLUX.1-schnell:preferred".
+    Uses provider="auto" and model "black-forest-labs/FLUX.1-schnell".
 
     Important: This function does NOT write any files to disk.
     It converts the returned image (PIL.Image or raw bytes) into PNG bytes
@@ -137,7 +137,7 @@ def generate_image_router(prompt: str) -> bytes:
     Raises:
         IRAProviderError if inference returns an unexpected result or fails.
     """
-    model_ref = "black-forest-labs/FLUX.1-schnell:preferred"
+    model_ref = "black-forest-labs/FLUX.1-schnell"
 
     try:
         client = InferenceClient(model=model_ref, provider="auto")

@@ -142,7 +142,8 @@ def _call_hf_image_model(prompt: str, model: str, token: str, **kwargs) -> bytes
     try:
         url = f"https://api-inference.huggingface.co/models/{model}"
         headers = {"Authorization": f"Bearer {token}"}
-        payload = {"inputs": prompt}
+        # include wait_for_model to handle cold starts gracefully
+        payload = {"inputs": prompt, "options": {"wait_for_model": True}}
         resp = requests.post(url, json=payload, headers=headers, timeout=120)
         resp.raise_for_status()
         # HF may return JSON with base64 or binary like image data depending on model.
@@ -165,7 +166,8 @@ def _call_hf_image_model(prompt: str, model: str, token: str, **kwargs) -> bytes
         else:
             return resp.content
     except Exception:
-        logger.exception("AI Generation Error - Hugging Face image generation failed")
+        # Per requirement, log with this specific message for flux failures
+        logger.exception("Flux Image Generation Failed")
         raise
 
 
@@ -174,23 +176,36 @@ def _call_hf_image_model(prompt: str, model: str, token: str, **kwargs) -> bytes
 def generate_image_router(prompt: str, hf_model: str = "black-forest-labs/FLUX.1-schnell") -> bytes:
     """Route image generation requests to Hugging Face Flux.1 models using
     rotating HF tokens. Returns image bytes.
+
+    This function applies a lightweight GPT Image 2-style prompt enhancer
+    via string templating only (no extra LLM calls) to improve photorealism
+    while adding zero server load.
     """
+    # Zero extra server load: deterministic string enhancement only
+    enhanced_prompt = (
+        f"{prompt}, studio-grade photorealism, true-to-life color science, "
+        "realistic skin textures and material physics, cinematic lighting with natural shadows, "
+        "sharp focus, highly detailed textures, shot on 35mm lens, f/1.8 aperture, 8k resolution, "
+        "clean composition, zero AI artifacts."
+    )
+
     token = _pick_key(_HF_TOKENS, "hf")
     if not token:
         raise RuntimeError("No Hugging Face token available in environment")
+
     try:
-        return _call_hf_image_model(prompt, hf_model, token)
+        return _call_hf_image_model(enhanced_prompt, hf_model, token)
     except Exception:
+        logger.exception("Flux Image Generation Failed")
         # Attempt fallback token(s) if any remain
-        logger.exception("Primary HF token failed, trying fallbacks if available")
-        # Try remaining tokens sequentially
-        for _ in range(len(_HF_TOKENS) - 1):
+        for _ in range(max(0, len(_HF_TOKENS) - 1)):
             token = _pick_key(_HF_TOKENS, "hf")
             try:
-                return _call_hf_image_model(prompt, hf_model, token)
+                return _call_hf_image_model(enhanced_prompt, hf_model, token)
             except Exception:
-                logger.exception("HF fallback token also failed")
-        raise
+                logger.exception("Flux Image Generation Failed")
+        # If all tokens failed, raise a descriptive error
+        raise RuntimeError("All Hugging Face Flux tokens failed to generate the image")
 
 
 def is_secret_request(user_text: str) -> bool:

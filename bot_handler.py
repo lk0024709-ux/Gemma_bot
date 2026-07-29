@@ -27,7 +27,9 @@ Logic:
 import logging
 import os
 import asyncio
+import threading
 from typing import Dict, Optional
+from http.server import HTTPServer, BaseHTTPRequestHandler
 
 from telegram import Update
 from telegram.constants import ChatAction
@@ -80,6 +82,45 @@ def _set_system_prompt(chat_id: int, prompt: str) -> None:
     """Set the custom system prompt for a chat."""
     state = _get_state(chat_id)
     state["system_prompt"] = prompt
+
+
+# ---------------------------------------------------------------------------
+# HTTP Health Check Server (for Render port binding)
+# ---------------------------------------------------------------------------
+
+class HealthCheckHandler(BaseHTTPRequestHandler):
+    """Simple HTTP handler that returns 200 OK on GET /"""
+
+    def do_GET(self):
+        """Handle GET requests."""
+        if self.path == "/":
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain")
+            self.end_headers()
+            self.wfile.write(b"Bot is alive")
+        else:
+            self.send_response(404)
+            self.send_header("Content-Type", "text/plain")
+            self.end_headers()
+            self.wfile.write(b"Not Found")
+
+    def log_message(self, format, *args):
+        """Suppress default HTTP logging."""
+        logger.debug(f"HTTP: {format % args}")
+
+
+def _start_health_check_server() -> None:
+    """
+    Start a lightweight HTTP server in a background daemon thread.
+    Binds to the PORT environment variable (default 10000).
+    This satisfies Render's health checks without blocking the Telegram bot.
+    """
+    port = int(os.environ.get("PORT", 10000))
+    server = HTTPServer(("0.0.0.0", port), HealthCheckHandler)
+    logger.info(f"🌐 Health check server started on port {port}")
+    
+    # Run the server indefinitely (in background thread)
+    server.serve_forever()
 
 
 # ---------------------------------------------------------------------------
@@ -395,19 +436,24 @@ def register_handlers(application: Application) -> None:
 
 
 def main():
-    """Main entry point: initialize and run the Telegram bot with polling."""
+    """Main entry point: start health check server and run Telegram bot polling."""
     token = os.environ.get("TELEGRAM_BOT_TOKEN")
     if not token:
         logger.error("TELEGRAM_BOT_TOKEN missing in environment!")
         return
 
+    # Start health check HTTP server in background daemon thread (for Render)
+    health_thread = threading.Thread(target=_start_health_check_server, daemon=True)
+    health_thread.start()
+
+    # Initialize and configure the Telegram bot
     app = Application.builder().token(token).build()
 
     # Register handlers
     register_handlers(app)
 
     logger.info("🤖 IRA Bot is starting (polling mode)...")
-    # Run polling cleanly in the main thread
+    # Run polling cleanly in the main thread (blocks until shutdown)
     app.run_polling(drop_pending_updates=True)
 
 

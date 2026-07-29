@@ -2,6 +2,7 @@ import os
 import base64
 import asyncio
 import logging
+import re
 import telebot
 from typing import Dict
 
@@ -26,13 +27,22 @@ user_modes: Dict[int, str] = {}
 
 
 # Helper to run async coroutine from sync telebot handler
-def run_async_coro(coro):
+def run_async_coro(coro_or_result):
+    """Accept either a coroutine or a normal synchronous result.
+    If coro_or_result is a coroutine, run it and return its result. Otherwise
+    return the provided result directly. This avoids errors when callers
+    pass sync functions' return values by accident.
+    """
     try:
-        return asyncio.run(coro)
+        if asyncio.iscoroutine(coro_or_result):
+            return asyncio.run(coro_or_result)
+        return coro_or_result
     except RuntimeError:
         # If there's already an active event loop in the current thread
         loop = asyncio.get_event_loop()
-        return loop.run_until_complete(coro)
+        if asyncio.iscoroutine(coro_or_result):
+            return loop.run_until_complete(coro_or_result)
+        return coro_or_result
 
 
 # Helper to query gatekeeper safely without circular imports
@@ -81,7 +91,8 @@ def set_normal_mode(message):
 # Command Handlers (Image Generation via Hugging Face Flux models)
 # ---------------------------------------------------------------------------
 
-@bot.message_handler(commands=['draw', 'imagine'])
+# This handler covers /draw, /imagine and /image commands
+@bot.message_handler(commands=['draw', 'imagine', 'image'])
 def handle_draw_command(message):
     chat_id = message.chat.id
     user_id = message.from_user.id
@@ -98,27 +109,73 @@ def handle_draw_command(message):
         return
 
     prompt = parts[1].strip()
-    status_msg = bot.reply_to(message, "🎨 Generating your masterpiece via HF Flux.1... Please wait a moment.")
+    _handle_image_generation_flow(message, prompt)
+
+
+# Handler to detect inline or text-triggered @image <prompt>
+@bot.message_handler(func=lambda m: isinstance(m.text, str) and re.search(r"(^|\s)@image\s+(.+)", m.text, flags=re.IGNORECASE), content_types=['text'])
+def handle_atimage_trigger(message):
+    chat_id = message.chat.id
+    user_id = message.from_user.id
+
+    # Validate gatekeeper membership
+    if not run_async_coro(check_membership(user_id)):
+        bot.reply_to(message, "🚫 Access Denied: You must join our channel to use this bot.")
+        return
+
+    # Extract prompt after @image (first occurrence)
+    m = re.search(r"@image\s+(.+)", message.text, flags=re.IGNORECASE)
+    if not m:
+        bot.reply_to(message, "🎨 Please provide a prompt after @image. Example: `@image a serene beach at sunset`")
+        return
+
+    prompt = m.group(1).strip()
+    _handle_image_generation_flow(message, prompt)
+
+
+def _handle_image_generation_flow(message, prompt: str):
+    """Shared flow for image generation: sends progress, calls generator,
+    handles exceptions and responds with photo bytes or error message.
+    """
+    chat_id = message.chat.id
+
+    # Send immediate progress message
+    status_msg = bot.reply_to(message, "🎨 Generating image with FLUX.1-schnell, please wait...")
 
     try:
         bot.send_chat_action(chat_id, "upload_photo")
+
+        # generate_image_router is synchronous and returns bytes; our helper
+        # run_async_coro will simply return non-coroutine results.
         img_bytes = run_async_coro(generate_image_router(prompt))
-        
+
+        if not img_bytes:
+            raise RuntimeError("Image generation returned no data.")
+
         # Send photo back to the user
         bot.send_photo(
-            chat_id, 
-            img_bytes, 
-            reply_to_message_id=message.message_id, 
+            chat_id,
+            img_bytes,
+            reply_to_message_id=message.message_id,
             caption=f"✨ Generated Masterpiece:\n\"{prompt}\""
         )
+
         # Delete helper status message
         try:
             bot.delete_message(chat_id, status_msg.message_id)
         except Exception:
             pass
+
     except Exception as e:
         logger.error(f"Image generation failed: {e}")
-        bot.edit_message_text(f"❌ Image generation failed: {str(e)}", chat_id, status_msg.message_id)
+        # Try to edit the status message if possible, otherwise reply
+        try:
+            bot.edit_message_text(f"❌ Image generation failed: {str(e)}", chat_id, status_msg.message_id)
+        except Exception:
+            try:
+                bot.reply_to(message, f"❌ Image generation failed: {str(e)}")
+            except Exception:
+                logger.exception("Failed to notify user of image generation failure")
 
 
 # ---------------------------------------------------------------------------

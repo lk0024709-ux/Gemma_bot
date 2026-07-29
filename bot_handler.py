@@ -1,310 +1,441 @@
-import os
-import base64
-import asyncio
+"""
+bot_handler.py - Telegram Bot Command Routing & State Management for IRA
+
+Uses python-telegram-bot v20+ (async-native).
+
+Commands:
+  /Start    - Welcome message with command list
+  /Flash    - Groq mode (llama3-8b-8192)
+  /Thinking - DeepSeek mode (deepseek-r1)
+  /Pro      - Scout mode (llama-4-scout)
+  /Expert   - Maverick mode (llama-4-maverick)
+  /Core     - Gemma mode (gemma-3) [default]
+  /Image    - Flux mode (FLUX.1-schnell)
+  /Custom   - Set custom system prompt
+  /IRA      - Activate IRA identity
+
+State: user_states[chat_id] = {"mode": "Gemma", "system_prompt": ""}
+
+Logic:
+  - If command has text after it (e.g., /Flash What is AI?),
+    generate response immediately using that mode.
+  - If command is alone (e.g., /Flash), switch active mode.
+"""
+
 import logging
-import re
-import telebot
-from typing import Dict
+from typing import Dict, Optional
 
-# Import router engines and database
-from ai_router import smart_gemma_router, generate_image_router, DEFAULT_MODEL
+from telegram import Update
+from telegram.constants import ChatAction
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    MessageHandler,
+    filters,
+    ContextTypes,
+)
 
-# Set up logging
-logging.basicConfig(level=logging.INFO)
+from ai_router import (
+    route_text,
+    route_image,
+    MODE_GROQ,
+    MODE_DEEPSEEK,
+    MODE_SCOUT,
+    MODE_MAVERICK,
+    MODE_GEMMA,
+    MODE_FLUX,
+    DEFAULT_MODE,
+    IRA_SYSTEM_PROMPT,
+    IRAAllProvidersFailed,
+)
+
 logger = logging.getLogger(__name__)
 
-# Load Bot Token
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-if not TELEGRAM_BOT_TOKEN or TELEGRAM_BOT_TOKEN.startswith("<YOUR_"):
-    # Fallback/placeholder to avoid direct crash during static validation imports
-    TELEGRAM_BOT_TOKEN = "754321098:AAG_mock_token_for_validation_purposes"
+# ---------------------------------------------------------------------------
+# State Management
+# ---------------------------------------------------------------------------
 
-bot = telebot.TeleBot(TELEGRAM_BOT_TOKEN)
-
-# 1. State Management
-# In-memory dictionary tracking active modes for each chat_id (default "normal")
-# For image mode we store the model string (e.g. IMAGE_MODE_MODEL) to allow
-# per-chat configuration in the future.
-user_modes: Dict[int, str] = {}
-
-# Image mode model constant
-IMAGE_MODE_MODEL = "black-forest-labs/FLUX.1-schnell:preferred"
+user_states: Dict[int, dict] = {}
 
 
-# Helper to run async coroutine from sync telebot handler
-def run_async_coro(coro_or_result):
-    """Accept either a coroutine or a normal synchronous result.
-    If coro_or_result is a coroutine, run it and return its result. Otherwise
-    return the provided result directly. This avoids errors when callers
-    pass sync functions' return values by accident.
+def _get_state(chat_id: int) -> dict:
+    """Get or initialize user state for a chat."""
+    if chat_id not in user_states:
+        user_states[chat_id] = {"mode": DEFAULT_MODE, "system_prompt": ""}
+    return user_states[chat_id]
+
+
+def _set_mode(chat_id: int, mode: str) -> None:
+    """Set the active mode for a chat."""
+    state = _get_state(chat_id)
+    state["mode"] = mode
+
+
+def _set_system_prompt(chat_id: int, prompt: str) -> None:
+    """Set the custom system prompt for a chat."""
+    state = _get_state(chat_id)
+    state["system_prompt"] = prompt
+
+
+# ---------------------------------------------------------------------------
+# Welcome / Help
+# ---------------------------------------------------------------------------
+
+WELCOME_TEXT = """🤖 *Welcome to IRA — Your Multi-Model AI Assistant!*
+
+Created by *Aditya Upadhyay*
+
+Here are your available commands:
+
+⚡ /Flash — Ultra-fast mode (Groq Llama 3)
+🧠 /Thinking — Deep reasoning mode (DeepSeek R1)
+💼 /Pro — Professional scout mode (Llama 4 Scout)
+🎯 /Expert — Expert maverick mode (Llama 4 Maverick)
+💎 /Core — Balanced default mode (Gemma 3)
+🎨 /Image — Image generation mode (FLUX.1-schnell)
+
+📝 /Custom <prompt> — Set a custom response style
+🤖 /IRA — Activate IRA's full identity
+
+*How to use:*
+• Send a command alone to switch modes (e.g., `/Flash`)
+• Add text after a command for instant response (e.g., `/Flash What is AI?`)
+• In any mode, just send a message and I'll respond!
+
+Currently active: *{mode}*
+"""
+
+
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /start command - send welcome message."""
+    chat_id = update.effective_chat.id
+    state = _get_state(chat_id)
+    text = WELCOME_TEXT.format(mode=state["mode"])
+    try:
+        await update.message.reply_text(text, parse_mode="Markdown")
+    except Exception:
+        logger.exception("Failed to send welcome message")
+        await update.message.reply_text("Welcome to IRA! Send any message to get started.")
+
+
+# ---------------------------------------------------------------------------
+# Mode Switch Commands
+# ---------------------------------------------------------------------------
+
+async def _handle_mode_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    mode: str,
+    mode_label: str,
+    mode_emoji: str,
+) -> None:
     """
-    try:
-        if asyncio.iscoroutine(coro_or_result):
-            return asyncio.run(coro_or_result)
-        return coro_or_result
-    except RuntimeError:
-        # If there's already an active event loop in the current thread
-        loop = asyncio.get_event_loop()
-        if asyncio.iscoroutine(coro_or_result):
-            return loop.run_until_complete(coro_or_result)
-        return coro_or_result
+    Generic handler for mode-switching commands.
 
-
-# Helper to query gatekeeper safely without circular imports
-async def check_membership(user_id: int) -> bool:
-    try:
-        from main import is_user_member
-        return await is_user_member(user_id)
-    except Exception as e:
-        logger.warning(f"Error checking membership gatekeeper: {e}. Defaulting to True.")
-        return True
-
-
-# ---------------------------------------------------------------------------
-# Command Handlers (Modes)
-# ---------------------------------------------------------------------------
-
-@bot.message_handler(commands=['flash'])
-def set_flash_mode(message):
-    chat_id = message.chat.id
-    user_modes[chat_id] = "flash"
-    bot.reply_to(message, "⚡ Flash Mode Activated! Responses will be lightning fast.")
-
-
-@bot.message_handler(commands=['reasoning'])
-def set_reasoning_mode(message):
-    chat_id = message.chat.id
-    user_modes[chat_id] = "reasoning"
-    bot.reply_to(message, "🧠 Reasoning Mode Activated! I’ll analyze requests step-by-step before concluding.")
-
-
-@bot.message_handler(commands=['pro'])
-def set_pro_mode(message):
-    chat_id = message.chat.id
-    user_modes[chat_id] = "pro"
-    bot.reply_to(message, "💼 Pro Mode Activated! Expect senior-level, professional, highly accurate responses.")
-
-
-@bot.message_handler(commands=['normal'])
-def set_normal_mode(message):
-    chat_id = message.chat.id
-    user_modes[chat_id] = "normal"
-    bot.reply_to(message, "✅ Normal Mode Activated! Back to balanced responses.")
-
-
-@bot.message_handler(commands=['chat'])
-def set_chat_mode(message):
-    """Switch back to text chat mode for the chat."""
-    chat_id = message.chat.id
-    user_modes[chat_id] = "normal"
-    bot.reply_to(message, "💬 Switched back to Text Chat mode.")
-
-
-@bot.message_handler(commands=['image'])
-def image_command_handler(message):
-    """/image with prompt -> single-shot generation; /image alone -> switch to image mode."""
-    chat_id = message.chat.id
-    user_id = message.from_user.id
-
-    # Validate gatekeeper membership
-    if not run_async_coro(check_membership(user_id)):
-        bot.reply_to(message, "🚫 Access Denied: You must join our channel to use this bot.")
-        return
-
-    parts = message.text.split(maxsplit=1)
-    # If prompt supplied, treat as single-shot prompt
-    if len(parts) > 1 and parts[1].strip():
-        prompt = parts[1].strip()
-        _handle_image_generation_flow(message, prompt)
-        return
-
-    # No prompt: switch to persistent image mode
-    user_modes[chat_id] = IMAGE_MODE_MODEL
-    bot.reply_to(message, "🎨 Image Generation Mode activated! Any prompt you send now will generate an image using FLUX.1-schnell. Use /chat or /models to switch back to text chat.")
-
-
-# ---------------------------------------------------------------------------
-# Command Handlers (Image Generation via Hugging Face Flux models)
-# ---------------------------------------------------------------------------
-
-# This handler covers /draw, /imagine and /image (single-shot handled above)
-@bot.message_handler(commands=['draw', 'imagine'])
-def handle_draw_command(message):
-    chat_id = message.chat.id
-    user_id = message.from_user.id
-
-    # Validate gatekeeper membership
-    if not run_async_coro(check_membership(user_id)):
-        bot.reply_to(message, "🚫 Access Denied: You must join our channel to use this bot.")
-        return
-
-    # Extract user prompt from slash command
-    parts = message.text.split(maxsplit=1)
-    if len(parts) < 2 or not parts[1].strip():
-        bot.reply_to(message, "🎨 Please specify a prompt. Example: `/draw a futuristic spaceship`", parse_mode="Markdown")
-        return
-
-    prompt = parts[1].strip()
-    _handle_image_generation_flow(message, prompt)
-
-
-# Handler to detect inline or text-triggered @image <prompt>
-@bot.message_handler(func=lambda m: isinstance(m.text, str) and re.search(r"(^|\s)@image\s+(.+)", m.text, flags=re.IGNORECASE), content_types=['text'])
-def handle_atimage_trigger(message):
-    chat_id = message.chat.id
-    user_id = message.from_user.id
-
-    # Validate gatekeeper membership
-    if not run_async_coro(check_membership(user_id)):
-        bot.reply_to(message, "🚫 Access Denied: You must join our channel to use this bot.")
-        return
-
-    # Extract prompt after @image (first occurrence)
-    m = re.search(r"@image\s+(.+)", message.text, flags=re.IGNORECASE)
-    if not m:
-        bot.reply_to(message, "🎨 Please provide a prompt after @image. Example: `@image a serene beach at sunset`")
-        return
-
-    prompt = m.group(1).strip()
-    _handle_image_generation_flow(message, prompt)
-
-
-def _handle_image_generation_flow(message, prompt: str):
-    """Shared flow for image generation: sends progress, calls generator,
-    handles exceptions and responds with photo bytes or error message.
+    If text follows the command, generate response in that mode immediately.
+    If command alone, switch the user's active mode.
     """
-    chat_id = message.chat.id
+    chat_id = update.effective_chat.id
+    message_text = update.message.text or ""
 
-    # Send immediate progress message
-    status_msg = bot.reply_to(message, "🎨 Generating image with FLUX.1-schnell, please wait...")
+    # Extract text after the command (e.g., "/Flash What is AI?" -> "What is AI?")
+    parts = message_text.split(maxsplit=1)
+    inline_prompt = parts[1].strip() if len(parts) > 1 else ""
+
+    if inline_prompt:
+        # Generate response immediately using this mode
+        await _generate_and_reply(update, inline_prompt, mode, chat_id)
+    else:
+        # Switch mode
+        _set_mode(chat_id, mode)
+        try:
+            await update.message.reply_text(
+                f"{mode_emoji} Switched to {mode_label} mode."
+            )
+        except Exception:
+            logger.exception("Failed to send mode switch confirmation")
+
+
+async def cmd_flash(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /Flash - Groq mode."""
+    await _handle_mode_command(update, context, MODE_GROQ, "Flash (Groq)", "⚡")
+
+
+async def cmd_thinking(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /Thinking - DeepSeek mode."""
+    await _handle_mode_command(update, context, MODE_DEEPSEEK, "Thinking (DeepSeek)", "🧠")
+
+
+async def cmd_pro(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /Pro - Scout mode."""
+    await _handle_mode_command(update, context, MODE_SCOUT, "Pro (Scout)", "💼")
+
+
+async def cmd_expert(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /Expert - Maverick mode."""
+    await _handle_mode_command(update, context, MODE_MAVERICK, "Expert (Maverick)", "🎯")
+
+
+async def cmd_core(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /Core - Gemma mode (default)."""
+    await _handle_mode_command(update, context, MODE_GEMMA, "Core (Gemma)", "💎")
+
+
+async def cmd_image(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /Image - Flux image generation mode."""
+    chat_id = update.effective_chat.id
+    message_text = update.message.text or ""
+
+    parts = message_text.split(maxsplit=1)
+    inline_prompt = parts[1].strip() if len(parts) > 1 else ""
+
+    if inline_prompt:
+        # Generate image immediately
+        await _generate_image_and_reply(update, inline_prompt, chat_id)
+    else:
+        # Switch to image mode
+        _set_mode(chat_id, MODE_FLUX)
+        try:
+            await update.message.reply_text("🎨 Switched to Image mode.")
+        except Exception:
+            logger.exception("Failed to send mode switch confirmation")
+
+
+# ---------------------------------------------------------------------------
+# Custom Prompt & IRA Identity Commands
+# ---------------------------------------------------------------------------
+
+async def cmd_custom(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /Custom <prompt> - Update the system prompt."""
+    chat_id = update.effective_chat.id
+    message_text = update.message.text or ""
+
+    parts = message_text.split(maxsplit=1)
+    custom_prompt = parts[1].strip() if len(parts) > 1 else ""
+
+    if custom_prompt:
+        _set_system_prompt(chat_id, custom_prompt)
+        try:
+            await update.message.reply_text("✅ Custom response style updated.")
+        except Exception:
+            logger.exception("Failed to confirm custom prompt update")
+    else:
+        try:
+            await update.message.reply_text(
+                "📝 Usage: /Custom <your preferred response style>\n"
+                "Example: /Custom Reply in a pirate accent"
+            )
+        except Exception:
+            logger.exception("Failed to send custom prompt usage")
+
+
+async def cmd_ira(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /IRA - Activate IRA identity."""
+    chat_id = update.effective_chat.id
+    _set_system_prompt(chat_id, IRA_SYSTEM_PROMPT)
+    try:
+        await update.message.reply_text(
+            "🤖 IRA Identity Activated.\n\n"
+            "I am IRA, an advanced multi-model AI assistant created by Aditya Upadhyay. "
+            "All my systems are fully operational and at your service."
+        )
+    except Exception:
+        logger.exception("Failed to send IRA identity confirmation")
+
+
+# ---------------------------------------------------------------------------
+# Message Handler (text messages, non-command)
+# ---------------------------------------------------------------------------
+
+async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Handle all non-command text messages.
+
+    Routes based on current mode:
+      - Flux mode -> Image Generator
+      - Any other mode -> Text Generator (with user's system_prompt)
+    """
+    chat_id = update.effective_chat.id
+    state = _get_state(chat_id)
+    user_text = update.message.text or ""
+
+    if not user_text.strip():
+        return
+
+    mode = state["mode"]
+    system_prompt = state["system_prompt"]
+
+    if mode == MODE_FLUX:
+        await _generate_image_and_reply(update, user_text, chat_id)
+    else:
+        await _generate_and_reply(update, user_text, mode, chat_id, system_prompt)
+
+
+# ---------------------------------------------------------------------------
+# Internal: Generate & Reply Helpers
+# ---------------------------------------------------------------------------
+
+async def _generate_and_reply(
+    update: Update,
+    prompt: str,
+    mode: str,
+    chat_id: int,
+    system_prompt: str = "",
+) -> None:
+    """
+    Send a 'Thinking...' placeholder, generate AI response, then edit or replace it.
+    """
+    status_msg = None
+    try:
+        # Send transient status message
+        status_msg = await update.message.reply_text("💬 Thinking...")
+        await update.effective_chat.send_action(ChatAction.TYPING)
+    except Exception:
+        logger.warning("Could not send status message, continuing without it")
+        status_msg = None
 
     try:
-        bot.send_chat_action(chat_id, "upload_photo")
+        reply = route_text(prompt, mode, system_prompt=system_prompt)
 
-        # generate_image_router is synchronous and returns bytes; our helper
-        # run_async_coro will simply return non-coroutine results.
-        img_bytes = run_async_coro(generate_image_router(prompt))
+        # Edit the status message with the actual reply
+        if status_msg:
+            try:
+                await status_msg.edit_text(reply)
+            except Exception:
+                # If edit fails (e.g., message too long), delete and send new
+                try:
+                    await status_msg.delete()
+                except Exception:
+                    pass
+                await update.message.reply_text(reply)
+        else:
+            await update.message.reply_text(reply)
 
-        if not img_bytes:
-            raise RuntimeError("Image generation returned no data.")
+    except IRAAllProvidersFailed as exc:
+        error_text = "⚠️ Sorry, the AI service is temporarily unavailable. Please try again shortly."
+        logger.error("All providers failed for chat %d: %s", chat_id, exc)
 
-        # Send photo back to the user
-        bot.send_photo(
-            chat_id,
-            img_bytes,
-            reply_to_message_id=message.message_id,
-            caption=f"✨ Generated Masterpiece:\n\"{prompt}\""
+        if status_msg:
+            try:
+                await status_msg.edit_text(error_text)
+            except Exception:
+                try:
+                    await status_msg.delete()
+                except Exception:
+                    pass
+                await update.message.reply_text(error_text)
+        else:
+            await update.message.reply_text(error_text)
+
+    except Exception as exc:
+        error_text = "❌ An unexpected error occurred. Please try again."
+        logger.exception("Unexpected error generating response for chat %d", chat_id)
+
+        if status_msg:
+            try:
+                await status_msg.edit_text(error_text)
+            except Exception:
+                try:
+                    await status_msg.delete()
+                except Exception:
+                    pass
+                await update.message.reply_text(error_text)
+        else:
+            await update.message.reply_text(error_text)
+
+
+async def _generate_image_and_reply(
+    update: Update,
+    prompt: str,
+    chat_id: int,
+) -> None:
+    """
+    Send a 'Generating...' placeholder, generate image, then send photo and delete placeholder.
+    """
+    status_msg = None
+    try:
+        status_msg = await update.message.reply_text("🎨 Generating...")
+        await update.effective_chat.send_action(ChatAction.UPLOAD_PHOTO)
+    except Exception:
+        logger.warning("Could not send status message for image generation")
+        status_msg = None
+
+    try:
+        image_bytes = route_image(prompt)
+
+        # Send the photo
+        import io
+        photo = io.BytesIO(image_bytes)
+        photo.name = "ira_generated_image.png"
+
+        await update.message.reply_photo(
+            photo=photo,
+            caption=f"✨ Generated: \"{prompt}\"",
         )
 
-        # Delete helper status message
-        try:
-            bot.delete_message(chat_id, status_msg.message_id)
-        except Exception:
-            pass
-
-    except Exception as e:
-        logger.error(f"Image generation failed: {e}")
-        # Try to edit the status message if possible, otherwise reply
-        try:
-            bot.edit_message_text(f"❌ Image generation failed: {str(e)}", chat_id, status_msg.message_id)
-        except Exception:
+        # Delete the status message
+        if status_msg:
             try:
-                bot.reply_to(message, f"❌ Image generation failed: {str(e)}")
+                await status_msg.delete()
             except Exception:
-                logger.exception("Failed to notify user of image generation failure")
+                pass
+
+    except IRAAllProvidersFailed as exc:
+        error_text = "⚠️ Image generation service is temporarily unavailable. Please try again shortly."
+        logger.error("All image providers failed for chat %d: %s", chat_id, exc)
+
+        if status_msg:
+            try:
+                await status_msg.edit_text(error_text)
+            except Exception:
+                try:
+                    await status_msg.delete()
+                except Exception:
+                    pass
+                await update.message.reply_text(error_text)
+        else:
+            await update.message.reply_text(error_text)
+
+    except Exception as exc:
+        error_text = "❌ Image generation failed. Please try a different prompt."
+        logger.exception("Unexpected error generating image for chat %d", chat_id)
+
+        if status_msg:
+            try:
+                await status_msg.edit_text(error_text)
+            except Exception:
+                try:
+                    await status_msg.delete()
+                except Exception:
+                    pass
+                await update.message.reply_text(error_text)
+        else:
+            await update.message.reply_text(error_text)
 
 
 # ---------------------------------------------------------------------------
-# Vision Handler (Image analysis via Google multimodal Gemma 3 endpoint)
+# Application Builder - Called by main.py
 # ---------------------------------------------------------------------------
 
-@bot.message_handler(content_types=['photo'])
-def handle_photo_message(message):
-    chat_id = message.chat.id
-    user_id = message.from_user.id
+def register_handlers(application: Application) -> None:
+    """
+    Register all command and message handlers on the Application instance.
+    Called from main.py during bot initialization.
+    """
+    # Command handlers
+    application.add_handler(CommandHandler("start", cmd_start))
+    application.add_handler(CommandHandler("flash", cmd_flash))
+    application.add_handler(CommandHandler("thinking", cmd_thinking))
+    application.add_handler(CommandHandler("pro", cmd_pro))
+    application.add_handler(CommandHandler("expert", cmd_expert))
+    application.add_handler(CommandHandler("core", cmd_core))
+    application.add_handler(CommandHandler("image", cmd_image))
+    application.add_handler(CommandHandler("custom", cmd_custom))
+    application.add_handler(CommandHandler("ira", cmd_ira))
 
-    # Validate gatekeeper membership
-    if not run_async_coro(check_membership(user_id)):
-        bot.reply_to(message, "🚫 Access Denied: You must join our channel to use this bot.")
-        return
+    # Text message handler (non-command messages)
+    application.add_handler(
+        MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_message)
+    )
 
-    bot.send_chat_action(chat_id, 'typing')
-
-    try:
-        # Retrieve highest resolution photo
-        photo = message.photo[-1]
-        file_info = bot.get_file(photo.file_id)
-        downloaded_file = bot.download_file(file_info.file_path)
-
-        # Convert to Base64 string
-        image_base64 = base64.b64encode(downloaded_file).decode('utf-8')
-
-        # Retrieve optional user caption or use default
-        caption = message.caption or "Analyze this image"
-
-        # Determine current chat mode
-        mode = user_modes.get(chat_id, "normal")
-
-        # Execute routing via primary multimodal engine (Google Gemma 3)
-        reply = run_async_coro(smart_gemma_router(
-            caption,
-            mode=mode,
-            image_base64=image_base64,
-            chat_id=chat_id,
-            user_id=user_id
-        ))
-
-        bot.reply_to(message, reply)
-    except Exception as e:
-        logger.error(f"Error handling photo message: {e}")
-        bot.reply_to(message, "⚠️ Failed to analyze image. Please verify your config and try again.")
-
-
-# ---------------------------------------------------------------------------
-# Text Handler (Standard / Multi-tier fallback execution)
-# ---------------------------------------------------------------------------
-
-@bot.message_handler(func=lambda msg: True, content_types=['text'])
-def handle_text_message(message):
-    # Ensure standard text messages starting with "/" are treated as commands or ignored
-    if message.text.startswith('/'):
-        return
-
-    chat_id = message.chat.id
-    user_id = message.from_user.id
-
-    # Validate gatekeeper membership
-    if not run_async_coro(check_membership(user_id)):
-        bot.reply_to(message, "🚫 Access Denied: You must join our channel to use this bot.")
-        return
-
-    bot.send_chat_action(chat_id, 'typing')
-
-    # If this chat is in image mode, treat any plain text as an image prompt
-    mode = user_modes.get(chat_id, "normal")
-    if mode == IMAGE_MODE_MODEL:
-        # Directly handle as image prompt
-        _handle_image_generation_flow(message, message.text)
-        return
-
-    # Fetch active chat execution mode for text routing
-    try:
-        reply = run_async_coro(smart_gemma_router(
-            message.text,
-            mode=mode,
-            chat_id=chat_id,
-            user_id=user_id
-        ))
-        bot.reply_to(message, reply)
-    except Exception as e:
-        logger.error(f"Error handling text message: {e}")
-        bot.reply_to(message, "⚠️ Failed to process your request. Please try again.")
-
-
-def start_bot_polling():
-    logger.info("Initializing Telegram Bot polling...")
-    bot.infinity_polling(skip_pending=True)
-
-
-if __name__ == "__main__":
-    start_bot_polling()
+    logger.info("All IRA bot handlers registered.")

@@ -10,6 +10,11 @@ This is the single entry point that bot_handler.py calls to generate responses.
 import logging
 from typing import Optional
 
+# New imports for fast in-memory image generation
+from huggingface_hub import InferenceClient
+from PIL import Image
+import io
+
 from ai_fallback import (
     call_groq,
     call_github_models,
@@ -113,9 +118,15 @@ def route_text(prompt: str, mode: str, system_prompt: str = "") -> str:
 # Image Generation Router
 # ---------------------------------------------------------------------------
 
-def route_image(prompt: str) -> bytes:
+def generate_image_router(prompt: str) -> bytes:
     """
-    Route an image generation request to the Flux provider.
+    Fast in-memory image generation using Hugging Face InferenceClient.
+
+    Uses provider="auto" and model "black-forest-labs/FLUX.1-schnell:preferred".
+
+    Important: This function does NOT write any files to disk.
+    It converts the returned image (PIL.Image or raw bytes) into PNG bytes
+    via io.BytesIO and returns the bytes.
 
     Args:
         prompt: The user's image description.
@@ -124,9 +135,81 @@ def route_image(prompt: str) -> bytes:
         PNG image bytes.
 
     Raises:
-        IRAAllProvidersFailed if all HF tokens fail.
+        IRAProviderError if inference returns an unexpected result or fails.
     """
-    return call_hf_flux(prompt)
+    model_ref = "black-forest-labs/FLUX.1-schnell:preferred"
+
+    try:
+        client = InferenceClient(model=model_ref, provider="auto")
+    except Exception as exc:
+        logger.exception("Failed to create InferenceClient")
+        raise IRAProviderError(f"InferenceClient initialization failed: {exc}") from exc
+
+    try:
+        # Use the text_to_image convenience method which typically returns raw bytes.
+        # Different HF backends may return bytes, a PIL.Image, or structured dicts.
+        response = client.text_to_image(prompt=prompt)
+
+        # If we received raw bytes already (PNG/JPEG), try to load via PIL and re-encode to PNG bytes.
+        if isinstance(response, (bytes, bytearray)):
+            try:
+                img = Image.open(io.BytesIO(response))
+                out = io.BytesIO()
+                img.save(out, format="PNG")
+                return out.getvalue()
+            except Exception:
+                # As a fallback, return raw bytes if PIL cannot parse (still in-memory, no disk usage).
+                return bytes(response)
+
+        # If a PIL image object was returned
+        if isinstance(response, Image.Image):
+            out = io.BytesIO()
+            response.save(out, format="PNG")
+            return out.getvalue()
+
+        # If it's a dict or other structure, attempt to extract base64 payloads
+        if isinstance(response, dict):
+            # Common keys: "image" (base64), "data" (list with b64_json), etc.
+            import base64
+
+            if "image" in response and isinstance(response["image"], str):
+                data = base64.b64decode(response["image"])
+                img = Image.open(io.BytesIO(data))
+                out = io.BytesIO()
+                img.save(out, format="PNG")
+                return out.getvalue()
+
+            if "data" in response and isinstance(response["data"], list):
+                for item in response["data"]:
+                    if isinstance(item, dict) and "b64_json" in item:
+                        data = base64.b64decode(item["b64_json"])
+                        img = Image.open(io.BytesIO(data))
+                        out = io.BytesIO()
+                        img.save(out, format="PNG")
+                        return out.getvalue()
+
+        # If none of the above matched, raise an error
+        raise IRAProviderError(f"Unexpected HF InferenceClient response type: {type(response)}")
+
+    except Exception as exc:
+        logger.exception("Hugging Face inference failed for prompt: %s", prompt)
+        # Wrap in IRAProviderError so callers can handle provider-specific failures.
+        raise IRAProviderError(str(exc)) from exc
+
+
+def route_image(prompt: str) -> bytes:
+    """
+    Route an image generation request.
+
+    Kept for backward compatibility: delegates to generate_image_router.
+    """
+    # Prefer the new fast in-memory router
+    try:
+        return generate_image_router(prompt)
+    except IRAProviderError:
+        # Fall back to the older HF caller with fallback token logic
+        logger.info("Falling back to ai_fallback.call_hf_flux for prompt")
+        return call_hf_flux(prompt)
 
 
 # ---------------------------------------------------------------------------

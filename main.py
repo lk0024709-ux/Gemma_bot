@@ -204,6 +204,10 @@ def _run_telegram_bot() -> None:
     """
     import asyncio
 
+    # Create and set event loop for this background thread
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+
     bot_token = os.getenv("TELEGRAM_BOT_TOKEN", "")
     if not bot_token:
         logger.error("TELEGRAM_BOT_TOKEN not set. Bot cannot start.")
@@ -226,6 +230,12 @@ def _run_telegram_bot() -> None:
 
     except Exception:
         logger.exception("Telegram bot crashed")
+    finally:
+        # Clean up the event loop
+        try:
+            loop.close()
+        except Exception:
+            pass
 
 
 # ---------------------------------------------------------------------------

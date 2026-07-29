@@ -122,6 +122,11 @@ def generate_image_router(prompt: str) -> bytes:
     Uses direct REST API calls (no SDK) to avoid third-party provider routing.
     Returns image bytes directly from the API response.
 
+    Tries loading numbered HF tokens to match Render environment configuration:
+    - First tries HF_TOKEN_1
+    - Then tries HF_TOKEN_2
+    - Finally tries HF_TOKEN (for backwards compatibility)
+
     Args:
         prompt: The user's image description.
 
@@ -129,12 +134,14 @@ def generate_image_router(prompt: str) -> bytes:
         Image bytes (binary content, typically PNG or JPEG).
 
     Raises:
-        ValueError if HF_TOKEN environment variable is missing.
+        ValueError if no HF token is found in environment variables.
         IRAProviderError if API request fails or returns an error.
     """
-    token = os.environ.get("HF_TOKEN")
+    # Try getting token from numbered variable names (Render config style)
+    token = os.environ.get("HF_TOKEN_1") or os.environ.get("HF_TOKEN_2") or os.environ.get("HF_TOKEN")
+    
     if not token:
-        raise ValueError("HF_TOKEN environment variable is missing!")
+        raise ValueError("HF Token is missing in Render! Please ensure HF_TOKEN_1 or HF_TOKEN_2 is set.")
 
     api_url = "https://router.huggingface.co/hf-inference/models/black-forest-labs/FLUX.1-schnell"
     headers = {"Authorization": f"Bearer {token}"}

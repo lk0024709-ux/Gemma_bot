@@ -25,6 +25,7 @@ Logic:
 """
 
 import logging
+import asyncio
 from typing import Dict, Optional
 
 from telegram import Update
@@ -286,18 +287,25 @@ async def _generate_image_and_reply(update: Update, prompt: str, chat_id: int) -
         status_msg = await update.message.reply_text("🎨 Generating image, please wait...")
         await update.effective_chat.send_action(ChatAction.UPLOAD_PHOTO)
         
-        # Call fast in-memory router
-        image_bytes = generate_image_router(prompt)
+        # Call fast in-memory router in a thread to avoid blocking the event loop
+        image_bytes = await asyncio.to_thread(generate_image_router, prompt)
         
         # Send photo directly from RAM
         await update.message.reply_photo(photo=image_bytes)
-        await status_msg.delete()
+        if status_msg:
+            try:
+                await status_msg.delete()
+            except Exception:
+                pass
         
     except Exception as e:
         logger.exception(f"Image generation failed for user {chat_id}")
         error_msg = f"❌ Error generating image: {str(e)}"
         if status_msg:
-            await status_msg.edit_text(error_msg)
+            try:
+                await status_msg.edit_text(error_msg)
+            except Exception:
+                await update.message.reply_text(error_msg)
         else:
             await update.message.reply_text(error_msg)
 
@@ -311,17 +319,30 @@ async def _generate_and_reply(
         status_msg = await update.message.reply_text(f"💬 Generating response in {mode} mode...")
         await update.effective_chat.send_action(ChatAction.TYPING)
         
-        # Note: Since route_text might be synchronous, ideally wrap in run_in_executor
-        # But keeping it simple as per your current setup
-        response_text = route_text(prompt, mode, system_prompt)
+        # Run potentially blocking text generation off the event loop
+        response_text = await asyncio.to_thread(route_text, prompt, mode, system_prompt)
         
-        await status_msg.edit_text(response_text, parse_mode="Markdown")
+        # Edit status message with response (may be long)
+        if status_msg:
+            try:
+                await status_msg.edit_text(response_text)
+            except Exception:
+                try:
+                    await status_msg.delete()
+                except Exception:
+                    pass
+                await update.message.reply_text(response_text)
+        else:
+            await update.message.reply_text(response_text)
         
     except Exception as e:
         logger.exception(f"Text generation failed for user {chat_id}")
         error_msg = f"❌ Error: {str(e)}"
         if status_msg:
-            await status_msg.edit_text(error_msg)
+            try:
+                await status_msg.edit_text(error_msg)
+            except Exception:
+                await update.message.reply_text(error_msg)
         else:
             await update.message.reply_text(error_msg)
 

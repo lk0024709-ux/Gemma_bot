@@ -7,7 +7,7 @@ import telebot
 from typing import Dict
 
 # Import router engines and database
-from ai_router import smart_gemma_router, generate_image_router
+from ai_router import smart_gemma_router, generate_image_router, DEFAULT_MODEL
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
@@ -23,7 +23,12 @@ bot = telebot.TeleBot(TELEGRAM_BOT_TOKEN)
 
 # 1. State Management
 # In-memory dictionary tracking active modes for each chat_id (default "normal")
+# For image mode we store the model string (e.g. IMAGE_MODE_MODEL) to allow
+# per-chat configuration in the future.
 user_modes: Dict[int, str] = {}
+
+# Image mode model constant
+IMAGE_MODE_MODEL = "black-forest-labs/FLUX.1-schnell:preferred"
 
 
 # Helper to run async coroutine from sync telebot handler
@@ -87,12 +92,43 @@ def set_normal_mode(message):
     bot.reply_to(message, "✅ Normal Mode Activated! Back to balanced responses.")
 
 
+@bot.message_handler(commands=['chat'])
+def set_chat_mode(message):
+    """Switch back to text chat mode for the chat."""
+    chat_id = message.chat.id
+    user_modes[chat_id] = "normal"
+    bot.reply_to(message, "💬 Switched back to Text Chat mode.")
+
+
+@bot.message_handler(commands=['image'])
+def image_command_handler(message):
+    """/image with prompt -> single-shot generation; /image alone -> switch to image mode."""
+    chat_id = message.chat.id
+    user_id = message.from_user.id
+
+    # Validate gatekeeper membership
+    if not run_async_coro(check_membership(user_id)):
+        bot.reply_to(message, "🚫 Access Denied: You must join our channel to use this bot.")
+        return
+
+    parts = message.text.split(maxsplit=1)
+    # If prompt supplied, treat as single-shot prompt
+    if len(parts) > 1 and parts[1].strip():
+        prompt = parts[1].strip()
+        _handle_image_generation_flow(message, prompt)
+        return
+
+    # No prompt: switch to persistent image mode
+    user_modes[chat_id] = IMAGE_MODE_MODEL
+    bot.reply_to(message, "🎨 Image Generation Mode activated! Any prompt you send now will generate an image using FLUX.1-schnell. Use /chat or /models to switch back to text chat.")
+
+
 # ---------------------------------------------------------------------------
 # Command Handlers (Image Generation via Hugging Face Flux models)
 # ---------------------------------------------------------------------------
 
-# This handler covers /draw, /imagine and /image commands
-@bot.message_handler(commands=['draw', 'imagine', 'image'])
+# This handler covers /draw, /imagine and /image (single-shot handled above)
+@bot.message_handler(commands=['draw', 'imagine'])
 def handle_draw_command(message):
     chat_id = message.chat.id
     user_id = message.from_user.id
@@ -244,9 +280,14 @@ def handle_text_message(message):
 
     bot.send_chat_action(chat_id, 'typing')
 
-    # Fetch active chat execution mode
+    # If this chat is in image mode, treat any plain text as an image prompt
     mode = user_modes.get(chat_id, "normal")
+    if mode == IMAGE_MODE_MODEL:
+        # Directly handle as image prompt
+        _handle_image_generation_flow(message, message.text)
+        return
 
+    # Fetch active chat execution mode for text routing
     try:
         reply = run_async_coro(smart_gemma_router(
             message.text,

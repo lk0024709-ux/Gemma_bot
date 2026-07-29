@@ -4,6 +4,10 @@ python-telegram-bot>=20.0,<22.0
 fastapi>=0.100.0,<1.0
 uvicorn[standard]>=0.22.0
 
+# Hugging Face & Imaging
+huggingface_hub>=0.16.4
+pillow>=9.0.0
+
 # HTTP & Networking
 httpx>=0.24.0
 requests>=2.31.0

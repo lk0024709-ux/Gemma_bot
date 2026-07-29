@@ -71,7 +71,7 @@ DEFAULT_MODEL = "gemma-3-27b-it"
 IMAGE_ENHANCER_ENABLED = os.getenv("IMAGE_ENHANCER_ENABLED", "true").lower() in ("1", "true", "yes")
 IMAGE_ENHANCER_TEMPLATE = os.getenv(
     "IMAGE_ENHANCER_TEMPLATE",
-    "{prompt}, studio-grade photorealism, true-to-life color science, realistic skin textures and material physics, cinematic lighting with natural shadows, sharp focus, highly detailed textures, shot on 35mm lens, f/1.8 aperture, 8k resolution, clean composition, zero AI artifacts."
+    "{prompt}, studio-grade photorealism, true-to-life color science, realistic skin textures and material physics, cinematic lighting with natural shadows, sharp focus, highly detailed textures, shot on 35mm lens, f/1.8 aperture, 8k resolution, clean composition, zero AI artifacts, no watermarks, no signatures, no text."
 )
 # Backoff / retry config for HF
 HF_MAX_RETRIES = int(os.getenv("HF_MAX_RETRIES", "3"))

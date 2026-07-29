@@ -17,9 +17,5 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Copy the rest of the application code
 COPY . .
 
-# Expose default port (optional metadata)
-EXPOSE 10000
-
-# Run the FastAPI app with Uvicorn and bind to 0.0.0.0 and the $PORT env var Render provides.
-# Use sh -c so the shell expands the ${PORT:-10000} default.
-CMD ["sh", "-c", "uvicorn main:app --host 0.0.0.0 --port ${PORT:-10000}"]
+# Run the Telegram bot directly with polling
+CMD ["python", "bot_handler.py"]

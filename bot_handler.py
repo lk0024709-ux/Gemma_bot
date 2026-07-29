@@ -25,6 +25,7 @@ Logic:
 """
 
 import logging
+import os
 import asyncio
 from typing import Dict, Optional
 
@@ -84,10 +85,27 @@ def _set_system_prompt(chat_id: int, prompt: str) -> None:
 # ---------------------------------------------------------------------------
 # Welcome / Help
 # ---------------------------------------------------------------------------
-WELCOME_TEXT = """🤖 *Welcome to IRA — Your Multi-Model AI Assistant!*\n
-Created by *Aditya Upadhyay*\n
-Here are your available commands:\n
-⚡ /Flash — Ultra-fast mode (Groq Llama 3)\n🧠 /Thinking — Deep reasoning mode (DeepSeek R1)\n💼 /Pro — Professional scout mode (Llama 4 Scout)\n🎯 /Expert — Expert maverick mode (Llama 4 Maverick)\n💎 /Core — Balanced default mode (Gemma 3)\n🎨 /Image — Image generation mode (FLUX.1-schnell)\n\n📝 /Custom <prompt> — Set a custom response style\n🤖 /IRA — Activate IRA's full identity\n\n*How to use:*\n• Send a command alone to switch modes (e.g., `/Flash`)\n• Add text after a command for instant response (e.g., `/Flash What is AI?`)\n• In any mode, just send a message and I'll respond!\n\nCurrently active: *{mode}*\n"""
+WELCOME_TEXT = """🤖 *Welcome to IRA — Your Multi-Model AI Assistant!*
+
+Created by *Aditya Upadhyay*
+
+Here are your available commands:
+
+⚡ /Flash — Ultra-fast mode (Groq Llama 3)
+🧠 /Thinking — Deep reasoning mode (DeepSeek R1)
+💼 /Pro — Professional scout mode (Llama 4 Scout)
+🎯 /Expert — Expert maverick mode (Llama 4 Maverick)
+💎 /Core — Core mode (Google Gemma 3) [default]
+🎨 /Image — Image generation mode (Flux)
+🎨 /Draw — Alias for /Image
+📝 /Custom — Set custom system prompt
+🤖 /IRA — Activate IRA identity
+
+**Current Mode:** {mode}
+
+Send any message to generate a response in your active mode.
+Send @image <prompt> to generate an image anytime.
+"""
 
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -277,7 +295,7 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 
 # ---------------------------------------------------------------------------
-# Generation Helpers (Paste this right below handle_text_message)
+# Generation Helpers
 # ---------------------------------------------------------------------------
 
 async def _generate_image_and_reply(update: Update, prompt: str, chat_id: int) -> None:
@@ -353,11 +371,7 @@ async def _generate_and_reply(
 
 
 def register_handlers(application: Application) -> None:
-    """Register all command and message handlers on the Application instance.
-
-    This function is consumed by main.py to attach handlers when starting the
-    Telegram bot in a background thread.
-    """
+    """Register all command and message handlers on the Application instance."""
     # Ensure image/draw are registered first (top)
     application.add_handler(CommandHandler("image", cmd_image))
     application.add_handler(CommandHandler("draw", cmd_draw))
@@ -381,7 +395,7 @@ def register_handlers(application: Application) -> None:
 
 
 def main():
-    import os
+    """Main entry point: initialize and run the Telegram bot with polling."""
     token = os.environ.get("TELEGRAM_BOT_TOKEN")
     if not token:
         logger.error("TELEGRAM_BOT_TOKEN missing in environment!")
@@ -389,11 +403,13 @@ def main():
 
     app = Application.builder().token(token).build()
 
-    # Register handlers via the shared function
+    # Register handlers
     register_handlers(app)
 
-    logger.info("Bot is starting...")
+    logger.info("🤖 IRA Bot is starting (polling mode)...")
+    # Run polling cleanly in the main thread
     app.run_polling(drop_pending_updates=True)
+
 
 if __name__ == "__main__":
     logging.basicConfig(

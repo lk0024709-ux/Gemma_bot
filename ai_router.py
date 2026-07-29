@@ -12,6 +12,7 @@ import os
 import time
 import requests
 from typing import Optional
+from urllib.parse import quote
 
 from ai_fallback import (
     call_groq,
@@ -118,7 +119,7 @@ def route_text(prompt: str, mode: str, system_prompt: str = "") -> str:
 
 def generate_image_with_meta(prompt: str) -> dict:
     """
-    Generate an image through Hugging Face's supported model endpoints.
+    Generate an image through the Pollinations.ai image generation endpoint.
 
     FLUX.1-dev is tried first. If it is unavailable, the request is retried with
     Stable Diffusion 3.5 Large. Direct REST calls are used (no SDK) to avoid
@@ -139,56 +140,22 @@ def generate_image_with_meta(prompt: str) -> dict:
         ValueError if no HF token is found in environment variables.
         IRAProviderError if every endpoint fails or returns an error.
     """
-    # Try getting token from numbered variable names (Render config style).
-    token = (
-        os.environ.get("HF_TOKEN_1")
-        or os.environ.get("HF_TOKEN_2")
-        or os.environ.get("HF_TOKEN")
-    )
-    if not token:
-        raise ValueError(
-            "HF Token is missing in Render! Please ensure HF_TOKEN_1, "
-            "HF_TOKEN_2, or HF_TOKEN is set."
+    encoded_prompt = quote(prompt, safe="")
+    url = f"https://image.pollinations.ai/prompt/{encoded_prompt}"
+
+    try:
+        logger.info("Calling Pollinations image endpoint")
+        response = requests.get(url, timeout=60)
+    except requests.RequestException as exc:
+        raise IRAProviderError(f"Pollinations network error: {exc}") from exc
+
+    if response.status_code != 200:
+        raise IRAProviderError(
+            f"Pollinations API Error ({response.status_code}): {response.text}"
         )
 
-    # Do not use the retired hf-inference FLUX.1-schnell router.
-    api_urls = (
-        "https://api-inference.huggingface.co/models/black-forest-labs/FLUX.1-dev",
-        "https://api-inference.huggingface.co/models/"
-        "stabilityai/stable-diffusion-3.5-large",
-    )
-    headers = {"Authorization": f"Bearer {token}"}
-    payload = {"inputs": prompt}
-    last_error = "Image generation failed before reaching Hugging Face."
-    start = time.monotonic()
-
-    for index, api_url in enumerate(api_urls):
-        try:
-            logger.info("Calling Hugging Face image endpoint (%d/%d)", index + 1, len(api_urls))
-            response = requests.post(api_url, headers=headers, json=payload, timeout=60)
-        except requests.RequestException as exc:
-            last_error = f"Network error: {exc}"
-            logger.warning("Hugging Face image endpoint request failed: %s", exc)
-            continue
-
-        if response.status_code == 200:
-            elapsed_ms = int((time.monotonic() - start) * 1000)
-            content_type = response.headers.get("Content-Type", "image/png")
-            model_id = api_url.split("/models/", 1)[-1] if "/models/" in api_url else api_url
-            logger.info("Image generated successfully (%d bytes)", len(response.content))
-            return {
-                "image": response.content,
-                "model": model_id,
-                "endpoint": api_url,
-                "content_type": content_type,
-                "elapsed_ms": elapsed_ms,
-                "size_bytes": len(response.content),
-            }
-
-        last_error = f"HF API Error ({response.status_code}): {response.text}"
-        logger.warning("Hugging Face image endpoint failed: %s", last_error)
-
-    raise IRAProviderError(last_error)
+    logger.info("Image generated successfully (%d bytes)", len(response.content))
+    return response.content
 
 
 def generate_image_router(prompt: str) -> bytes:

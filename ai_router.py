@@ -117,9 +117,11 @@ def route_text(prompt: str, mode: str, system_prompt: str = "") -> str:
 
 def generate_image_router(prompt: str) -> bytes:
     """
-    Direct HTTP POST to Hugging Face Serverless Endpoint for FLUX.1-schnell.
+    Generate an image through Hugging Face's supported model endpoints.
 
-    Uses direct REST API calls (no SDK) to avoid third-party provider routing.
+    FLUX.1-dev is tried first. If it is unavailable, the request is retried with
+    Stable Diffusion 3.5 Large. Direct REST calls are used (no SDK) to avoid
+    third-party provider routing.
     Returns image bytes directly from the API response.
 
     Tries loading numbered HF tokens to match Render environment configuration:
@@ -137,39 +139,45 @@ def generate_image_router(prompt: str) -> bytes:
         ValueError if no HF token is found in environment variables.
         IRAProviderError if API request fails or returns an error.
     """
-    # Try getting token from numbered variable names (Render config style)
-    token = os.environ.get("HF_TOKEN_1") or os.environ.get("HF_TOKEN_2") or os.environ.get("HF_TOKEN")
-    
+    # Try getting token from numbered variable names (Render config style).
+    token = (
+        os.environ.get("HF_TOKEN_1")
+        or os.environ.get("HF_TOKEN_2")
+        or os.environ.get("HF_TOKEN")
+    )
     if not token:
-        raise ValueError("HF Token is missing in Render! Please ensure HF_TOKEN_1 or HF_TOKEN_2 is set.")
-
-    api_url = "https://router.huggingface.co/hf-inference/models/black-forest-labs/FLUX.1-schnell"
-    headers = {"Authorization": f"Bearer {token}"}
-    payload = {"inputs": prompt}
-
-    try:
-        logger.info(f"Calling HF Serverless API for prompt: {prompt[:50]}...")
-        response = requests.post(
-            api_url,
-            headers=headers,
-            json=payload,
-            timeout=60
+        raise ValueError(
+            "HF Token is missing in Render! Please ensure HF_TOKEN_1, "
+            "HF_TOKEN_2, or HF_TOKEN is set."
         )
 
-        if response.status_code != 200:
-            error_msg = f"HF API Error ({response.status_code}): {response.text}"
-            logger.error(error_msg)
-            raise IRAProviderError(error_msg)
+    # Do not use the retired hf-inference FLUX.1-schnell router.
+    api_urls = (
+        "https://api-inference.huggingface.co/models/black-forest-labs/FLUX.1-dev",
+        "https://api-inference.huggingface.co/models/"
+        "stabilityai/stable-diffusion-3.5-large",
+    )
+    headers = {"Authorization": f"Bearer {token}"}
+    payload = {"inputs": prompt}
+    last_error = "Image generation failed before reaching Hugging Face."
 
-        logger.info(f"✅ Image generated successfully ({len(response.content)} bytes)")
-        return response.content
+    for index, api_url in enumerate(api_urls):
+        try:
+            logger.info("Calling Hugging Face image endpoint (%d/%d)", index + 1, len(api_urls))
+            response = requests.post(api_url, headers=headers, json=payload, timeout=60)
+        except requests.RequestException as exc:
+            last_error = f"Network error: {exc}"
+            logger.warning("Hugging Face image endpoint request failed: %s", exc)
+            continue
 
-    except requests.RequestException as exc:
-        logger.exception("Network error during HF API call")
-        raise IRAProviderError(f"Network error: {str(exc)}") from exc
-    except Exception as exc:
-        logger.exception("Unexpected error during image generation")
-        raise IRAProviderError(f"Unexpected error: {str(exc)}") from exc
+        if response.status_code == 200:
+            logger.info("Image generated successfully (%d bytes)", len(response.content))
+            return response.content
+
+        last_error = f"HF API Error ({response.status_code}): {response.text}"
+        logger.warning("Hugging Face image endpoint failed: %s", last_error)
+
+    raise IRAProviderError(last_error)
 
 
 def route_image(prompt: str) -> bytes:

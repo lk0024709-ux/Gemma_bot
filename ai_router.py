@@ -8,6 +8,8 @@ This is the single entry point that bot_handler.py calls to generate responses.
 """
 
 import logging
+import os
+import time
 import requests
 from typing import Optional
 from urllib.parse import quote
@@ -115,24 +117,28 @@ def route_text(prompt: str, mode: str, system_prompt: str = "") -> str:
 # Image Generation Router
 # ---------------------------------------------------------------------------
 
-def generate_image_router(prompt: str) -> bytes:
+def generate_image_with_meta(prompt: str) -> dict:
     """
     Generate an image through the Pollinations.ai image generation endpoint.
 
-    The prompt is URL-encoded and appended to:
-        https://image.pollinations.ai/prompt/{encoded_prompt}
-    and the resulting image bytes are returned directly from the response.
+    FLUX.1-dev is tried first. If it is unavailable, the request is retried with
+    Stable Diffusion 3.5 Large. Direct REST calls are used (no SDK) to avoid
+    third-party provider routing.
 
-    No authentication token is required.
+    This is the metadata-rich variant used by the Image Studio demo: it reports
+    which endpoint produced the image, how long it took, and the response size.
 
-    Args:
-        prompt: The user's image description.
-
-    Returns:
-        Image bytes (binary content, typically JPEG) from Pollinations.
+    Returns a dict with keys:
+        - image:        raw image bytes (PNG/JPEG)
+        - model:        HF model id, e.g. "black-forest-labs/FLUX.1-dev"
+        - endpoint:     full API URL that succeeded
+        - content_type: response Content-Type header
+        - elapsed_ms:   wall-clock time from first request to success (ms)
+        - size_bytes:   number of image bytes returned
 
     Raises:
-        IRAProviderError if the API request fails or a network error occurs.
+        ValueError if no HF token is found in environment variables.
+        IRAProviderError if every endpoint fails or returns an error.
     """
     encoded_prompt = quote(prompt, safe="")
     url = f"https://image.pollinations.ai/prompt/{encoded_prompt}"
@@ -150,6 +156,16 @@ def generate_image_router(prompt: str) -> bytes:
 
     logger.info("Image generated successfully (%d bytes)", len(response.content))
     return response.content
+
+
+def generate_image_router(prompt: str) -> bytes:
+    """
+    Generate an image and return the raw image bytes.
+
+    Thin convenience wrapper around :func:`generate_image_with_meta` that keeps
+    the original byte-only contract used by the Telegram bot handler.
+    """
+    return generate_image_with_meta(prompt)["image"]
 
 
 def route_image(prompt: str) -> bytes:

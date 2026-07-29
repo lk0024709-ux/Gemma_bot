@@ -25,9 +25,10 @@ from typing import Optional
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from ai_router import generate_api_response
+from ai_router import generate_api_response, generate_image_with_meta
 from bot_handler import register_handlers
 
 # ---------------------------------------------------------------------------
@@ -69,6 +70,23 @@ class ChatResponse(BaseModel):
     """Response sent back to TMA client."""
     reply: str
     user_id: int
+
+
+class ImageRequest(BaseModel):
+    """Incoming image-generation request from the Image Studio demo."""
+    prompt: str  # The text description to generate an image from
+
+
+class ImageResponse(BaseModel):
+    """Response from the /api/image endpoint."""
+    ok: bool
+    prompt: str
+    image_b64: str
+    content_type: str
+    model: str
+    endpoint: str
+    elapsed_ms: int
+    size_bytes: int
 
 
 # ---------------------------------------------------------------------------
@@ -177,6 +195,81 @@ async def api_chat(request: ChatRequest):
     return ChatResponse(reply=reply, user_id=user_id)
 
 
+# --------------------------------------------------------------------------- #
+# Image Generation Demo Endpoints
+#
+# These power the standalone "Image Studio" playground at /demo, used to test
+# the Flux image model (Hugging Face FLUX.1-dev -> stable-diffusion-3.5-large).
+# Unlike the Telegram bot path, these return JSON with the image (base64) plus
+# metadata so the UI can show which model produced each image and how long it
+# took.
+# --------------------------------------------------------------------------- #
+
+def _hf_token_configured() -> bool:
+    """True when at least one Hugging Face token is present in the environment."""
+    return bool(
+        os.getenv("HF_TOKEN_1") or os.getenv("HF_TOKEN_2") or os.getenv("HF_TOKEN")
+    )
+
+
+@app.get("/api/image/status")
+async def api_image_status():
+    """Report whether the image model is configured and ready to test."""
+    return {
+        "ok": True,
+        "token_configured": _hf_token_configured(),
+        "models": [
+            "black-forest-labs/FLUX.1-dev",
+            "stabilityai/stable-diffusion-3.5-large",
+        ],
+    }
+
+
+@app.post("/api/image", response_model=ImageResponse)
+async def api_image(request: ImageRequest):
+    """
+    POST /api/image - Generate a single image from a text prompt.
+
+    Returns the image as base64 plus timing/model metadata. Raises:
+      - 400 if the prompt is empty or no HF token is configured.
+      - 502 if every HF endpoint fails.
+    """
+    prompt = (request.prompt or "").strip()
+    if not prompt:
+        raise HTTPException(status_code=400, detail="A non-empty 'prompt' is required.")
+    if not _hf_token_configured():
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "No Hugging Face token configured. Set HF_TOKEN_1, HF_TOKEN_2, "
+                "or HF_TOKEN in your environment to test the image model."
+            ),
+        )
+
+    try:
+        meta = generate_image_with_meta(prompt)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        logger.exception("Image generation failed for /api/image")
+        raise HTTPException(
+            status_code=502, detail=f"Image generation failed: {exc}"
+        ) from exc
+
+    import base64
+
+    return ImageResponse(
+        ok=True,
+        prompt=prompt,
+        image_b64=base64.b64encode(meta["image"]).decode("ascii"),
+        content_type=meta["content_type"],
+        model=meta["model"],
+        endpoint=meta["endpoint"],
+        elapsed_ms=meta["elapsed_ms"],
+        size_bytes=meta["size_bytes"],
+    )
+
+
 @app.get("/")
 async def root():
     """Health check endpoint."""
@@ -191,6 +284,11 @@ async def root():
 async def health():
     """Simple health check for deployment platforms."""
     return {"ok": True}
+
+
+# Serve the standalone Image Studio demo UI at /demo
+# (html=True makes GET /demo/ resolve to demo/index.html)
+app.mount("/demo", StaticFiles(directory="demo", html=True), name="demo")
 
 
 # ---------------------------------------------------------------------------

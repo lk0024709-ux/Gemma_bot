@@ -11,6 +11,7 @@ Commands:
   /Expert   - Maverick mode (llama-4-maverick)
   /Core     - Gemma mode (gemma-3) [default]
   /Image    - Flux mode (FLUX.1-schnell)
+  /Draw     - Alias to /Image
   /Custom   - Set custom system prompt
   /IRA      - Activate IRA identity
 
@@ -20,6 +21,7 @@ Logic:
   - If command has text after it (e.g., /Flash What is AI?),
     generate response immediately using that mode.
   - If command is alone (e.g., /Flash), switch active mode.
+  - Messages starting with @image <prompt> are routed to image generation immediately.
 """
 
 import logging
@@ -38,6 +40,7 @@ from telegram.ext import (
 from ai_router import (
     route_text,
     route_image,
+    generate_image_router,  # new fast in-memory generator
     MODE_GROQ,
     MODE_DEEPSEEK,
     MODE_SCOUT,
@@ -80,30 +83,10 @@ def _set_system_prompt(chat_id: int, prompt: str) -> None:
 # ---------------------------------------------------------------------------
 # Welcome / Help
 # ---------------------------------------------------------------------------
-
-WELCOME_TEXT = """🤖 *Welcome to IRA — Your Multi-Model AI Assistant!*
-
-Created by *Aditya Upadhyay*
-
-Here are your available commands:
-
-⚡ /Flash — Ultra-fast mode (Groq Llama 3)
-🧠 /Thinking — Deep reasoning mode (DeepSeek R1)
-💼 /Pro — Professional scout mode (Llama 4 Scout)
-🎯 /Expert — Expert maverick mode (Llama 4 Maverick)
-💎 /Core — Balanced default mode (Gemma 3)
-🎨 /Image — Image generation mode (FLUX.1-schnell)
-
-📝 /Custom <prompt> — Set a custom response style
-🤖 /IRA — Activate IRA's full identity
-
-*How to use:*
-• Send a command alone to switch modes (e.g., `/Flash`)
-• Add text after a command for instant response (e.g., `/Flash What is AI?`)
-• In any mode, just send a message and I'll respond!
-
-Currently active: *{mode}*
-"""
+WELCOME_TEXT = """🤖 *Welcome to IRA — Your Multi-Model AI Assistant!*\n
+Created by *Aditya Upadhyay*\n
+Here are your available commands:\n
+⚡ /Flash — Ultra-fast mode (Groq Llama 3)\n🧠 /Thinking — Deep reasoning mode (DeepSeek R1)\n💼 /Pro — Professional scout mode (Llama 4 Scout)\n🎯 /Expert — Expert maverick mode (Llama 4 Maverick)\n💎 /Core — Balanced default mode (Gemma 3)\n🎨 /Image — Image generation mode (FLUX.1-schnell)\n\n📝 /Custom <prompt> — Set a custom response style\n🤖 /IRA — Activate IRA's full identity\n\n*How to use:*\n• Send a command alone to switch modes (e.g., `/Flash`)\n• Add text after a command for instant response (e.g., `/Flash What is AI?`)\n• In any mode, just send a message and I'll respond!\n\nCurrently active: *{mode}*\n"""
 
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -201,6 +184,12 @@ async def cmd_image(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             logger.exception("Failed to send mode switch confirmation")
 
 
+async def cmd_draw(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /Draw - Alias for /Image generation."""
+    # Mirror the /image behavior: accept inline prompt or switch to image mode
+    await cmd_image(update, context)
+
+
 # ---------------------------------------------------------------------------
 # Custom Prompt & IRA Identity Commands
 # ---------------------------------------------------------------------------
@@ -252,6 +241,7 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
     Handle all non-command text messages.
 
     Routes based on current mode:
+      - Messages starting with @image -> Image Generator flow
       - Flux mode -> Image Generator
       - Any other mode -> Text Generator (with user's system_prompt)
     """
@@ -260,6 +250,20 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
     user_text = update.message.text or ""
 
     if not user_text.strip():
+        return
+
+    # Intercept messages that start with the image prefix
+    stripped = user_text.lstrip()
+    if stripped.startswith("@image"):
+        # Remove the prefix and whitespace after it
+        prompt = stripped[len("@image"):].strip()
+        if not prompt:
+            try:
+                await update.message.reply_text("Please provide an image prompt after @image")
+            except Exception:
+                logger.exception("Failed to request prompt after @image")
+            return
+        await _generate_image_and_reply(update, prompt, chat_id)
         return
 
     mode = state["mode"]
@@ -272,170 +276,90 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 
 # ---------------------------------------------------------------------------
-# Internal: Generate & Reply Helpers
+# Generation Helpers (Paste this right below handle_text_message)
 # ---------------------------------------------------------------------------
+
+async def _generate_image_and_reply(update: Update, prompt: str, chat_id: int) -> None:
+    """Helper to generate and send an image fast."""
+    status_msg = None
+    try:
+        status_msg = await update.message.reply_text("🎨 Generating image, please wait...")
+        await update.effective_chat.send_action(ChatAction.UPLOAD_PHOTO)
+        
+        # Call fast in-memory router
+        image_bytes = generate_image_router(prompt)
+        
+        # Send photo directly from RAM
+        await update.message.reply_photo(photo=image_bytes)
+        await status_msg.delete()
+        
+    except Exception as e:
+        logger.exception(f"Image generation failed for user {chat_id}")
+        error_msg = f"❌ Error generating image: {str(e)}"
+        if status_msg:
+            await status_msg.edit_text(error_msg)
+        else:
+            await update.message.reply_text(error_msg)
+
 
 async def _generate_and_reply(
-    update: Update,
-    prompt: str,
-    mode: str,
-    chat_id: int,
-    system_prompt: str = "",
+    update: Update, prompt: str, mode: str, chat_id: int, system_prompt: str = ""
 ) -> None:
-    """
-    Send a 'Thinking...' placeholder, generate AI response, then edit or replace it.
-    """
+    """Helper to generate and send a text response."""
     status_msg = None
     try:
-        # Send transient status message
-        status_msg = await update.message.reply_text("💬 Thinking...")
+        status_msg = await update.message.reply_text(f"💬 Generating response in {mode} mode...")
         await update.effective_chat.send_action(ChatAction.TYPING)
-    except Exception:
-        logger.warning("Could not send status message, continuing without it")
-        status_msg = None
-
-    try:
-        reply = route_text(prompt, mode, system_prompt=system_prompt)
-
-        # Edit the status message with the actual reply
+        
+        # Note: Since route_text might be synchronous, ideally wrap in run_in_executor
+        # But keeping it simple as per your current setup
+        response_text = route_text(prompt, mode, system_prompt)
+        
+        await status_msg.edit_text(response_text, parse_mode="Markdown")
+        
+    except Exception as e:
+        logger.exception(f"Text generation failed for user {chat_id}")
+        error_msg = f"❌ Error: {str(e)}"
         if status_msg:
-            try:
-                await status_msg.edit_text(reply)
-            except Exception:
-                # If edit fails (e.g., message too long), delete and send new
-                try:
-                    await status_msg.delete()
-                except Exception:
-                    pass
-                await update.message.reply_text(reply)
+            await status_msg.edit_text(error_msg)
         else:
-            await update.message.reply_text(reply)
-
-    except IRAAllProvidersFailed as exc:
-        error_text = "⚠️ Sorry, the AI service is temporarily unavailable. Please try again shortly."
-        logger.error("All providers failed for chat %d: %s", chat_id, exc)
-
-        if status_msg:
-            try:
-                await status_msg.edit_text(error_text)
-            except Exception:
-                try:
-                    await status_msg.delete()
-                except Exception:
-                    pass
-                await update.message.reply_text(error_text)
-        else:
-            await update.message.reply_text(error_text)
-
-    except Exception as exc:
-        error_text = "❌ An unexpected error occurred. Please try again."
-        logger.exception("Unexpected error generating response for chat %d", chat_id)
-
-        if status_msg:
-            try:
-                await status_msg.edit_text(error_text)
-            except Exception:
-                try:
-                    await status_msg.delete()
-                except Exception:
-                    pass
-                await update.message.reply_text(error_text)
-        else:
-            await update.message.reply_text(error_text)
-
-
-async def _generate_image_and_reply(
-    update: Update,
-    prompt: str,
-    chat_id: int,
-) -> None:
-    """
-    Send a 'Generating...' placeholder, generate image, then send photo and delete placeholder.
-    """
-    status_msg = None
-    try:
-        status_msg = await update.message.reply_text("🎨 Generating...")
-        await update.effective_chat.send_action(ChatAction.UPLOAD_PHOTO)
-    except Exception:
-        logger.warning("Could not send status message for image generation")
-        status_msg = None
-
-    try:
-        image_bytes = route_image(prompt)
-
-        # Send the photo
-        import io
-        photo = io.BytesIO(image_bytes)
-        photo.name = "ira_generated_image.png"
-
-        await update.message.reply_photo(
-            photo=photo,
-            caption=f"✨ Generated: \"{prompt}\"",
-        )
-
-        # Delete the status message
-        if status_msg:
-            try:
-                await status_msg.delete()
-            except Exception:
-                pass
-
-    except IRAAllProvidersFailed as exc:
-        error_text = "⚠️ Image generation service is temporarily unavailable. Please try again shortly."
-        logger.error("All image providers failed for chat %d: %s", chat_id, exc)
-
-        if status_msg:
-            try:
-                await status_msg.edit_text(error_text)
-            except Exception:
-                try:
-                    await status_msg.delete()
-                except Exception:
-                    pass
-                await update.message.reply_text(error_text)
-        else:
-            await update.message.reply_text(error_text)
-
-    except Exception as exc:
-        error_text = "❌ Image generation failed. Please try a different prompt."
-        logger.exception("Unexpected error generating image for chat %d", chat_id)
-
-        if status_msg:
-            try:
-                await status_msg.edit_text(error_text)
-            except Exception:
-                try:
-                    await status_msg.delete()
-                except Exception:
-                    pass
-                await update.message.reply_text(error_text)
-        else:
-            await update.message.reply_text(error_text)
+            await update.message.reply_text(error_msg)
 
 
 # ---------------------------------------------------------------------------
-# Application Builder - Called by main.py
+# Application Setup & Main
 # ---------------------------------------------------------------------------
 
-def register_handlers(application: Application) -> None:
-    """
-    Register all command and message handlers on the Application instance.
-    Called from main.py during bot initialization.
-    """
-    # Command handlers
-    application.add_handler(CommandHandler("start", cmd_start))
-    application.add_handler(CommandHandler("flash", cmd_flash))
-    application.add_handler(CommandHandler("thinking", cmd_thinking))
-    application.add_handler(CommandHandler("pro", cmd_pro))
-    application.add_handler(CommandHandler("expert", cmd_expert))
-    application.add_handler(CommandHandler("core", cmd_core))
-    application.add_handler(CommandHandler("image", cmd_image))
-    application.add_handler(CommandHandler("custom", cmd_custom))
-    application.add_handler(CommandHandler("ira", cmd_ira))
+def main():
+    import os
+    token = os.environ.get("TELEGRAM_BOT_TOKEN")
+    if not token:
+        logger.error("TELEGRAM_BOT_TOKEN missing in environment!")
+        return
 
-    # Text message handler (non-command messages)
-    application.add_handler(
-        MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_message)
+    app = Application.builder().token(token).build()
+
+    # CRITICAL ORDER: Commands FIRST
+    app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("image", cmd_image))
+    app.add_handler(CommandHandler("draw", cmd_draw))
+    app.add_handler(CommandHandler("flash", cmd_flash))
+    app.add_handler(CommandHandler("thinking", cmd_thinking))
+    app.add_handler(CommandHandler("pro", cmd_pro))
+    app.add_handler(CommandHandler("expert", cmd_expert))
+    app.add_handler(CommandHandler("core", cmd_core))
+    app.add_handler(CommandHandler("custom", cmd_custom))
+    app.add_handler(CommandHandler("ira", cmd_ira))
+
+    # General Text Handler LAST
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_message))
+
+    logger.info("Bot is starting...")
+    app.run_polling(drop_pending_updates=True)
+
+if __name__ == "__main__":
+    logging.basicConfig(
+        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", 
+        level=logging.INFO
     )
-
-    logger.info("All IRA bot handlers registered.")
+    main()

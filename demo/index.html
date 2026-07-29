@@ -1,0 +1,84 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta name="color-scheme" content="dark" />
+  <meta name="description" content="IRA Image Studio — interactive playground to test the Flux image model" />
+  <title>IRA · Image Studio</title>
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🎨</text></svg>" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <div class="studio">
+    <!-- ==================== Header ==================== -->
+    <header class="topbar">
+      <div class="brand">
+        <div class="brand-mark">🎨</div>
+        <div class="brand-text">
+          <h1>Image Studio</h1>
+          <span>Test the Flux image model · IRA</span>
+        </div>
+      </div>
+      <div class="status">
+        <span class="dot" id="statusDot"></span>
+        <span id="statusText">checking…</span>
+      </div>
+    </header>
+
+    <div class="layout">
+      <!-- ==================== Composer ==================== -->
+      <section class="composer">
+        <form id="promptForm" class="prompt-card">
+          <label for="prompt" class="prompt-label">Describe an image</label>
+          <textarea
+            id="prompt"
+            class="prompt-input"
+            rows="3"
+            placeholder="e.g. a neon-lit cyberpunk street market in the rain, ultra detailed, cinematic"
+            autocomplete="off"
+          ></textarea>
+
+          <div class="composer-actions">
+            <button type="button" id="surpriseBtn" class="btn-ghost">🎲 Surprise me</button>
+            <button type="submit" id="generateBtn" class="btn-primary">
+              <span class="btn-label">✨ Generate</span>
+              <span class="btn-spinner" hidden></span>
+            </button>
+          </div>
+
+          <div class="suggestions" id="suggestions">
+            <!-- chips injected by app.js -->
+          </div>
+        </form>
+
+        <div class="model-info">
+          <span class="model-tag" id="modelChain">FLUX.1-dev → stable-diffusion-3.5-large</span>
+          <span class="model-hint">Hugging Face · tries FLUX first, falls back to SD&nbsp;3.5</span>
+        </div>
+      </section>
+
+      <!-- ==================== Gallery ==================== -->
+      <section class="gallery-wrap">
+        <div class="gallery-head">
+          <h2>Results</h2>
+          <button type="button" id="clearBtn" class="btn-ghost" hidden>🧹 Clear</button>
+        </div>
+
+        <div class="gallery" id="gallery" aria-live="polite">
+          <div class="empty" id="emptyState">
+            <div class="empty-icon">🖼️</div>
+            <h3>No images yet</h3>
+            <p>Write a prompt above (or pick a suggestion) and hit Generate to test the model.</p>
+          </div>
+        </div>
+      </section>
+    </div>
+  </div>
+
+  <!-- Inline error banner -->
+  <div class="toast" id="toast" hidden></div>
+
+  <script src="app.js"></script>
+</body>
+</html>

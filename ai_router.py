@@ -9,6 +9,7 @@ This is the single entry point that bot_handler.py calls to generate responses.
 
 import logging
 import os
+import time
 import requests
 from typing import Optional
 
@@ -115,29 +116,28 @@ def route_text(prompt: str, mode: str, system_prompt: str = "") -> str:
 # Image Generation Router
 # ---------------------------------------------------------------------------
 
-def generate_image_router(prompt: str) -> bytes:
+def generate_image_with_meta(prompt: str) -> dict:
     """
     Generate an image through Hugging Face's supported model endpoints.
 
     FLUX.1-dev is tried first. If it is unavailable, the request is retried with
     Stable Diffusion 3.5 Large. Direct REST calls are used (no SDK) to avoid
     third-party provider routing.
-    Returns image bytes directly from the API response.
 
-    Tries loading numbered HF tokens to match Render environment configuration:
-    - First tries HF_TOKEN_1
-    - Then tries HF_TOKEN_2
-    - Finally tries HF_TOKEN (for backwards compatibility)
+    This is the metadata-rich variant used by the Image Studio demo: it reports
+    which endpoint produced the image, how long it took, and the response size.
 
-    Args:
-        prompt: The user's image description.
-
-    Returns:
-        Image bytes (binary content, typically PNG or JPEG).
+    Returns a dict with keys:
+        - image:        raw image bytes (PNG/JPEG)
+        - model:        HF model id, e.g. "black-forest-labs/FLUX.1-dev"
+        - endpoint:     full API URL that succeeded
+        - content_type: response Content-Type header
+        - elapsed_ms:   wall-clock time from first request to success (ms)
+        - size_bytes:   number of image bytes returned
 
     Raises:
         ValueError if no HF token is found in environment variables.
-        IRAProviderError if API request fails or returns an error.
+        IRAProviderError if every endpoint fails or returns an error.
     """
     # Try getting token from numbered variable names (Render config style).
     token = (
@@ -160,6 +160,7 @@ def generate_image_router(prompt: str) -> bytes:
     headers = {"Authorization": f"Bearer {token}"}
     payload = {"inputs": prompt}
     last_error = "Image generation failed before reaching Hugging Face."
+    start = time.monotonic()
 
     for index, api_url in enumerate(api_urls):
         try:
@@ -171,13 +172,33 @@ def generate_image_router(prompt: str) -> bytes:
             continue
 
         if response.status_code == 200:
+            elapsed_ms = int((time.monotonic() - start) * 1000)
+            content_type = response.headers.get("Content-Type", "image/png")
+            model_id = api_url.split("/models/", 1)[-1] if "/models/" in api_url else api_url
             logger.info("Image generated successfully (%d bytes)", len(response.content))
-            return response.content
+            return {
+                "image": response.content,
+                "model": model_id,
+                "endpoint": api_url,
+                "content_type": content_type,
+                "elapsed_ms": elapsed_ms,
+                "size_bytes": len(response.content),
+            }
 
         last_error = f"HF API Error ({response.status_code}): {response.text}"
         logger.warning("Hugging Face image endpoint failed: %s", last_error)
 
     raise IRAProviderError(last_error)
+
+
+def generate_image_router(prompt: str) -> bytes:
+    """
+    Generate an image and return the raw image bytes.
+
+    Thin convenience wrapper around :func:`generate_image_with_meta` that keeps
+    the original byte-only contract used by the Telegram bot handler.
+    """
+    return generate_image_with_meta(prompt)["image"]
 
 
 def route_image(prompt: str) -> bytes:

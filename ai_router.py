@@ -71,7 +71,7 @@ DEFAULT_MODEL = "gemma-3-27b-it"
 IMAGE_ENHANCER_ENABLED = os.getenv("IMAGE_ENHANCER_ENABLED", "true").lower() in ("1", "true", "yes")
 IMAGE_ENHANCER_TEMPLATE = os.getenv(
     "IMAGE_ENHANCER_TEMPLATE",
-    "{prompt}, studio-grade photorealism, true-to-life color science, realistic skin textures and material physics, cinematic lighting with natural shadows, sharp focus, highly detailed textures, shot on 35mm lens, f/1.8 aperture, 8k resolution, clean composition, zero AI artifacts, no watermarks, no signatures, no text."
+    "{prompt}, studio-grade photorealism, true-to-life color science, realistic skin textures and material physics, cinematic lighting with natural shadows, sharp focus, highly detailed textures, high resolution"
 )
 # Backoff / retry config for HF
 HF_MAX_RETRIES = int(os.getenv("HF_MAX_RETRIES", "3"))
@@ -91,56 +91,122 @@ def _pick_key(pool: List[str], pool_name: str) -> Optional[str]:
 # ---------------- Provider wrappers ----------------
 
 def _call_google_ai_studio(prompt: str, model: str, api_key: str, **kwargs) -> str:
-    """Placeholder HTTP call to Google AI Studio. Replace endpoint or client
-    calls if you have a dedicated SDK. This function is written defensively
-    and logs full tracebacks on exceptions.
+    """Call Google Gemini / Generative Language API (generateContent).
 
-    Important: Do NOT log the api_key itself.
+    Uses the REST endpoint:
+    https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}
+
+    Payload format: {"contents": [{"parts": [{"text": prompt}]}]}
     """
     try:
-        # Example endpoint - the exact path/params depend on your Google AI Studio setup.
-        url = os.getenv("GOOGLE_AI_ENDPOINT", "https://api.googleaistudio.example/v1/generate")
-        headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
-        payload = {"model": model, "prompt": prompt, "max_tokens": 512}
+        base = "https://generativelanguage.googleapis.com/v1beta/models"
+        url = f"{base}/{model}:generateContent?key={api_key}"
+        headers = {"Content-Type": "application/json"}
+        payload = {"contents": [{"parts": [{"text": prompt}]}]}
         resp = requests.post(url, json=payload, headers=headers, timeout=30)
         resp.raise_for_status()
         data = resp.json()
-        # Adapt extracting logic depending on real response format
-        return data.get("output", data.get("text", "")).strip()
+
+        # Robust extraction across possible response shapes
+        # 1) Look for 'candidates' -> each candidate may have 'content' which is a list of parts
+        if isinstance(data, dict):
+            candidates = data.get("candidates")
+            if isinstance(candidates, list) and candidates:
+                texts = []
+                for c in candidates:
+                    if not isinstance(c, dict):
+                        continue
+                    # Candidate may contain 'content' which is a list of dicts with 'text'
+                    content = c.get("content") or c.get("output") or []
+                    if isinstance(content, list):
+                        for item in content:
+                            if isinstance(item, dict) and "text" in item:
+                                texts.append(item["text"])
+                    # Some candidates include a top-level 'output' string
+                    if isinstance(c.get("output"), str):
+                        texts.append(c.get("output"))
+                if texts:
+                    return "\n".join([t.strip() for t in texts if t]).strip()
+
+            # 2) Older/simple shapes
+            if "output" in data and isinstance(data["output"], str):
+                return data["output"].strip()
+
+        # Fallback: return stringified JSON
+        return str(data).strip()
     except Exception:
         logger.exception("AI Generation Error - Google AI Studio call failed")
         raise
 
 
 def _call_github_models(prompt: str, model: str, token: str, **kwargs) -> str:
-    """Placeholder HTTP call to a GitHub hosted model endpoint. The concrete
-    endpoint or SDK may differ; adapt as needed. This is defensive and logs
-    exceptions.
+    """Call GitHub-hosted models via the Azure-compatible chat/completions endpoint.
+
+    Uses the OpenAI chat payload format: {"model": model, "messages": [{"role":"user","content":prompt}]}
+    Endpoint default: https://models.inference.ai.azure.com/chat/completions
     """
     try:
-        url = os.getenv("GITHUB_MODELS_ENDPOINT", "https://api.githubmodels.example/v1/generate")
+        url = os.getenv("GITHUB_MODELS_ENDPOINT", "https://models.inference.ai.azure.com/chat/completions")
         headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
-        payload = {"model": model, "input": prompt, "max_tokens": 1024}
+        payload = {"model": model, "messages": [{"role": "user", "content": prompt}]}
         resp = requests.post(url, json=payload, headers=headers, timeout=30)
         resp.raise_for_status()
         data = resp.json()
-        return data.get("output", data.get("text", "")).strip()
+
+        # OpenAI-like response parsing
+        if isinstance(data, dict):
+            choices = data.get("choices")
+            if isinstance(choices, list) and choices:
+                first = choices[0]
+                # Newer shape: choices[0]['message']['content']
+                msg = first.get("message")
+                if isinstance(msg, dict):
+                    content = msg.get("content") or msg.get("text")
+                    if isinstance(content, str):
+                        return content.strip()
+                    # content could be a list/dict in some implementations
+                # Fallback: choices[0]['text']
+                text = first.get("text")
+                if isinstance(text, str):
+                    return text.strip()
+        # Fallback
+        return str(data).strip()
     except Exception:
         logger.exception("AI Generation Error - GitHub Models call failed")
         raise
 
 
 def _call_groq(prompt: str, model: str, api_key: str, **kwargs) -> str:
-    """Placeholder HTTP call to Groq inference endpoint. Adapt as required.
+    """Call Groq's OpenAI-compatible chat completions endpoint.
+
+    Uses the OpenAI chat payload format: {"model": model, "messages": [{"role": "user", "content": prompt}]}
+    Endpoint: https://api.groq.com/openai/v1/chat/completions
     """
     try:
-        url = os.getenv("GROQ_ENDPOINT", "https://api.groq.example/v1/generate")
+        url = os.getenv("GROQ_ENDPOINT", "https://api.groq.com/openai/v1/chat/completions")
         headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
-        payload = {"model": model, "prompt": prompt, "max_tokens": 512}
+        payload = {"model": model, "messages": [{"role": "user", "content": prompt}]}
         resp = requests.post(url, json=payload, headers=headers, timeout=20)
         resp.raise_for_status()
         data = resp.json()
-        return data.get("output", data.get("text", "")).strip()
+
+        # OpenAI-style response parsing
+        if isinstance(data, dict):
+            choices = data.get("choices")
+            if isinstance(choices, list) and choices:
+                first = choices[0]
+                # Newer shape: choices[0]['message']['content']
+                msg = first.get("message")
+                if isinstance(msg, dict):
+                    content = msg.get("content") or msg.get("text")
+                    if isinstance(content, str):
+                        return content.strip()
+                # Fallback: choices[0]['text']
+                text = first.get("text")
+                if isinstance(text, str):
+                    return text.strip()
+        # Generic fallback
+        return str(data).strip()
     except Exception:
         logger.exception("AI Generation Error - Groq call failed")
         raise
@@ -278,6 +344,7 @@ def get_system_prompt(model_name: str) -> str:
     guardrails = (
         "You are a warm, polite, and friendly AI assistant."
         " Always be helpful, concise, and kind.\n\n"
+
         "Security guardrails (MUST follow):\n"
         "- Under NO circumstances reveal API keys, environment variables, secrets, or private server configuration.\n"
         "- If asked for secrets, keys, or internal implementation details, refuse politely with the message: \"I’m sorry, but I can’t share secrets, API keys, or private configuration.\"\n"

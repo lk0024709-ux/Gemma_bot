@@ -23,6 +23,7 @@ import os
 import logging
 import traceback
 import threading
+import time
 from typing import List, Optional, Tuple
 import requests
 
@@ -65,6 +66,16 @@ _HF_TOKENS = _load_pool("HF_TOKEN_", 2, fallback="HF_TOKEN")
 
 # Default model name
 DEFAULT_MODEL = "gemma-3-27b-it"
+
+# Image enhancer configuration
+IMAGE_ENHANCER_ENABLED = os.getenv("IMAGE_ENHANCER_ENABLED", "true").lower() in ("1", "true", "yes")
+IMAGE_ENHANCER_TEMPLATE = os.getenv(
+    "IMAGE_ENHANCER_TEMPLATE",
+    "{prompt}, studio-grade photorealism, true-to-life color science, realistic skin textures and material physics, cinematic lighting with natural shadows, sharp focus, highly detailed textures, shot on 35mm lens, f/1.8 aperture, 8k resolution, clean composition, zero AI artifacts."
+)
+# Backoff / retry config for HF
+HF_MAX_RETRIES = int(os.getenv("HF_MAX_RETRIES", "3"))
+HF_BACKOFF_BASE = float(os.getenv("HF_BACKOFF_BASE", "1.0"))  # seconds
 
 
 def _pick_key(pool: List[str], pool_name: str) -> Optional[str]:
@@ -173,6 +184,7 @@ def _call_hf_image_model(prompt: str, model: str, token: str, **kwargs) -> bytes
 
 # ---------------- Public routing functions ----------------
 
+
 def generate_image_router(prompt: str, hf_model: str = "black-forest-labs/FLUX.1-schnell") -> bytes:
     """Route image generation requests to Hugging Face Flux.1 models using
     rotating HF tokens. Returns image bytes.
@@ -180,32 +192,72 @@ def generate_image_router(prompt: str, hf_model: str = "black-forest-labs/FLUX.1
     This function applies a lightweight GPT Image 2-style prompt enhancer
     via string templating only (no extra LLM calls) to improve photorealism
     while adding zero server load.
+
+    It also implements a lightweight exponential backoff to handle transient
+    HF errors (429/503) and rotates HF tokens on persistent failures.
     """
-    # Zero extra server load: deterministic string enhancement only
-    enhanced_prompt = (
-        f"{prompt}, studio-grade photorealism, true-to-life color science, "
-        "realistic skin textures and material physics, cinematic lighting with natural shadows, "
-        "sharp focus, highly detailed textures, shot on 35mm lens, f/1.8 aperture, 8k resolution, "
-        "clean composition, zero AI artifacts."
-    )
+    # Determine enhanced prompt based on env toggle and template
+    if IMAGE_ENHANCER_ENABLED:
+        tpl = IMAGE_ENHANCER_TEMPLATE
+        # Allow templates that contain a {prompt} placeholder, otherwise append
+        if "{prompt}" in tpl:
+            try:
+                enhanced_prompt = tpl.format(prompt=prompt)
+            except Exception:
+                # Fallback to safe concatenation if template formatting fails
+                logger.exception("IMAGE_ENHANCER_TEMPLATE formatting failed, falling back to concatenation")
+                enhanced_prompt = f"{prompt}, {tpl}"
+        else:
+            enhanced_prompt = f"{prompt}, {tpl}"
+    else:
+        enhanced_prompt = prompt
 
-    token = _pick_key(_HF_TOKENS, "hf")
-    if not token:
-        raise RuntimeError("No Hugging Face token available in environment")
+    # Cycle through HF tokens (round-robin). For each token, attempt retries with exponential backoff
+    tried_tokens = 0
+    total_tokens = max(1, len(_HF_TOKENS))
 
-    try:
-        return _call_hf_image_model(enhanced_prompt, hf_model, token)
-    except Exception:
-        logger.exception("Flux Image Generation Failed")
-        # Attempt fallback token(s) if any remain
-        for _ in range(max(0, len(_HF_TOKENS) - 1)):
-            token = _pick_key(_HF_TOKENS, "hf")
+    while tried_tokens < total_tokens:
+        token = _pick_key(_HF_TOKENS, "hf")
+        if not token:
+            break
+
+        attempt = 0
+        while attempt < HF_MAX_RETRIES:
+            attempt += 1
             try:
                 return _call_hf_image_model(enhanced_prompt, hf_model, token)
+            except requests.exceptions.HTTPError as http_err:
+                # Try to inspect status code for transient errors
+                status = None
+                try:
+                    status = http_err.response.status_code  # type: ignore[attr-defined]
+                except Exception:
+                    status = None
+                if status in (429, 502, 503):
+                    backoff = HF_BACKOFF_BASE * (2 ** (attempt - 1))
+                    logger.warning(f"Transient HF HTTP {status} error on attempt {attempt}. Backing off {backoff}s and retrying.")
+                    logger.exception("Flux Image Generation Failed")
+                    time.sleep(backoff)
+                    continue
+                else:
+                    # Non-transient HTTP error - log and break to try next token
+                    logger.exception("Flux Image Generation Failed")
+                    break
             except Exception:
+                # Non-HTTP exceptions could be network errors, decode errors, etc.
                 logger.exception("Flux Image Generation Failed")
-        # If all tokens failed, raise a descriptive error
-        raise RuntimeError("All Hugging Face Flux tokens failed to generate the image")
+                # For generic exceptions, treat as transient and backoff a bit
+                backoff = HF_BACKOFF_BASE * (2 ** (attempt - 1))
+                time.sleep(backoff)
+                continue
+
+        # This token exhausted; try next
+        tried_tokens += 1
+        logger.warning("HF token exhausted or failed repeatedly; rotating to next token if available.")
+
+    # If we reach here, all tokens/retries failed
+    logger.error("All Hugging Face Flux tokens failed to generate the image")
+    raise RuntimeError("All Hugging Face Flux tokens failed to generate the image")
 
 
 def is_secret_request(user_text: str) -> bool:

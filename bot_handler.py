@@ -351,6 +351,35 @@ async def _generate_and_reply(
 # Application Setup & Main
 # ---------------------------------------------------------------------------
 
+
+def register_handlers(application: Application) -> None:
+    """Register all command and message handlers on the Application instance.
+
+    This function is consumed by main.py to attach handlers when starting the
+    Telegram bot in a background thread.
+    """
+    # Ensure image/draw are registered first (top)
+    application.add_handler(CommandHandler("image", cmd_image))
+    application.add_handler(CommandHandler("draw", cmd_draw))
+
+    # Other command handlers
+    application.add_handler(CommandHandler("start", cmd_start))
+    application.add_handler(CommandHandler("flash", cmd_flash))
+    application.add_handler(CommandHandler("thinking", cmd_thinking))
+    application.add_handler(CommandHandler("pro", cmd_pro))
+    application.add_handler(CommandHandler("expert", cmd_expert))
+    application.add_handler(CommandHandler("core", cmd_core))
+    application.add_handler(CommandHandler("custom", cmd_custom))
+    application.add_handler(CommandHandler("ira", cmd_ira))
+
+    # Text message handler (non-command messages) - must come after command handlers
+    application.add_handler(
+        MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_message)
+    )
+
+    logger.info("All IRA bot handlers registered.")
+
+
 def main():
     import os
     token = os.environ.get("TELEGRAM_BOT_TOKEN")
@@ -360,20 +389,8 @@ def main():
 
     app = Application.builder().token(token).build()
 
-    # CRITICAL ORDER: Commands FIRST
-    app.add_handler(CommandHandler("start", cmd_start))
-    app.add_handler(CommandHandler("image", cmd_image))
-    app.add_handler(CommandHandler("draw", cmd_draw))
-    app.add_handler(CommandHandler("flash", cmd_flash))
-    app.add_handler(CommandHandler("thinking", cmd_thinking))
-    app.add_handler(CommandHandler("pro", cmd_pro))
-    app.add_handler(CommandHandler("expert", cmd_expert))
-    app.add_handler(CommandHandler("core", cmd_core))
-    app.add_handler(CommandHandler("custom", cmd_custom))
-    app.add_handler(CommandHandler("ira", cmd_ira))
-
-    # General Text Handler LAST
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_message))
+    # Register handlers via the shared function
+    register_handlers(app)
 
     logger.info("Bot is starting...")
     app.run_polling(drop_pending_updates=True)

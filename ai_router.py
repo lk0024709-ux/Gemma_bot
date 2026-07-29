@@ -26,6 +26,9 @@ import threading
 import time
 from typing import List, Optional, Tuple
 import requests
+import io
+from huggingface_hub import InferenceClient
+from PIL import Image
 
 logger = logging.getLogger(__name__)
 logger.setLevel(os.environ.get("LOG_LEVEL", "INFO"))
@@ -108,7 +111,6 @@ def _call_google_ai_studio(prompt: str, model: str, api_key: str, **kwargs) -> s
         data = resp.json()
 
         # Robust extraction across possible response shapes
-        # 1) Look for 'candidates' -> each candidate may have 'content' which is a list of parts
         if isinstance(data, dict):
             candidates = data.get("candidates")
             if isinstance(candidates, list) and candidates:
@@ -116,23 +118,19 @@ def _call_google_ai_studio(prompt: str, model: str, api_key: str, **kwargs) -> s
                 for c in candidates:
                     if not isinstance(c, dict):
                         continue
-                    # Candidate may contain 'content' which is a list of dicts with 'text'
                     content = c.get("content") or c.get("output") or []
                     if isinstance(content, list):
                         for item in content:
                             if isinstance(item, dict) and "text" in item:
                                 texts.append(item["text"])
-                    # Some candidates include a top-level 'output' string
                     if isinstance(c.get("output"), str):
                         texts.append(c.get("output"))
                 if texts:
                     return "\n".join([t.strip() for t in texts if t]).strip()
 
-            # 2) Older/simple shapes
             if "output" in data and isinstance(data["output"], str):
                 return data["output"].strip()
 
-        # Fallback: return stringified JSON
         return str(data).strip()
     except Exception:
         logger.exception("AI Generation Error - Google AI Studio call failed")
@@ -153,23 +151,18 @@ def _call_github_models(prompt: str, model: str, token: str, **kwargs) -> str:
         resp.raise_for_status()
         data = resp.json()
 
-        # OpenAI-like response parsing
         if isinstance(data, dict):
             choices = data.get("choices")
             if isinstance(choices, list) and choices:
                 first = choices[0]
-                # Newer shape: choices[0]['message']['content']
                 msg = first.get("message")
                 if isinstance(msg, dict):
                     content = msg.get("content") or msg.get("text")
                     if isinstance(content, str):
                         return content.strip()
-                    # content could be a list/dict in some implementations
-                # Fallback: choices[0]['text']
                 text = first.get("text")
                 if isinstance(text, str):
                     return text.strip()
-        # Fallback
         return str(data).strip()
     except Exception:
         logger.exception("AI Generation Error - GitHub Models call failed")
@@ -190,22 +183,18 @@ def _call_groq(prompt: str, model: str, api_key: str, **kwargs) -> str:
         resp.raise_for_status()
         data = resp.json()
 
-        # OpenAI-style response parsing
         if isinstance(data, dict):
             choices = data.get("choices")
             if isinstance(choices, list) and choices:
                 first = choices[0]
-                # Newer shape: choices[0]['message']['content']
                 msg = first.get("message")
                 if isinstance(msg, dict):
                     content = msg.get("content") or msg.get("text")
                     if isinstance(content, str):
                         return content.strip()
-                # Fallback: choices[0]['text']
                 text = first.get("text")
                 if isinstance(text, str):
                     return text.strip()
-        # Generic fallback
         return str(data).strip()
     except Exception:
         logger.exception("AI Generation Error - Groq call failed")
@@ -219,31 +208,24 @@ def _call_hf_image_model(prompt: str, model: str, token: str, **kwargs) -> bytes
     try:
         url = f"https://api-inference.huggingface.co/models/{model}"
         headers = {"Authorization": f"Bearer {token}"}
-        # include wait_for_model to handle cold starts gracefully
         payload = {"inputs": prompt, "options": {"wait_for_model": True}}
         resp = requests.post(url, json=payload, headers=headers, timeout=120)
         resp.raise_for_status()
-        # HF may return JSON with base64 or binary like image data depending on model.
-        # If it's JSON with a base64 string under 'image', decode it. Otherwise return content.
         content_type = resp.headers.get("Content-Type", "")
         if "application/json" in content_type:
             data = resp.json()
-            # Look for common fields
             if isinstance(data, dict) and "image" in data:
                 import base64
                 return base64.b64decode(data["image"])
-            # Some models return {'data': [{'b64_json': '...'}]}
             if isinstance(data, dict) and "data" in data and isinstance(data["data"], list):
                 for item in data["data"]:
                     if isinstance(item, dict) and "b64_json" in item:
                         import base64
                         return base64.b64decode(item["b64_json"])
-            # Fallback - convert the JSON str
             return str(data).encode("utf-8")
         else:
             return resp.content
     except Exception:
-        # Per requirement, log with this specific message for flux failures
         logger.exception("Flux Image Generation Failed")
         raise
 
@@ -251,26 +233,20 @@ def _call_hf_image_model(prompt: str, model: str, token: str, **kwargs) -> bytes
 # ---------------- Public routing functions ----------------
 
 
-def generate_image_router(prompt: str, hf_model: str = "black-forest-labs/FLUX.1-schnell") -> bytes:
-    """Route image generation requests to Hugging Face Flux.1 models using
-    rotating HF tokens. Returns image bytes.
+def generate_image_router(prompt: str, hf_model: str = "black-forest-labs/FLUX.1-schnell:preferred") -> bytes:
+    """Generate an image using Hugging Face InferenceClient (preferred FLUX.1-schnell).
 
-    This function applies a lightweight GPT Image 2-style prompt enhancer
-    via string templating only (no extra LLM calls) to improve photorealism
-    while adding zero server load.
-
-    It also implements a lightweight exponential backoff to handle transient
-    HF errors (429/503) and rotates HF tokens on persistent failures.
+    This implementation prefers rotating HF tokens when available. It uses the
+    huggingface_hub.InferenceClient.text_to_image convenience method which may
+    return a PIL.Image.Image or raw bytes depending on the provider/model.
     """
-    # Determine enhanced prompt based on env toggle and template
+    # Enhance prompt if enabled
     if IMAGE_ENHANCER_ENABLED:
         tpl = IMAGE_ENHANCER_TEMPLATE
-        # Allow templates that contain a {prompt} placeholder, otherwise append
         if "{prompt}" in tpl:
             try:
                 enhanced_prompt = tpl.format(prompt=prompt)
             except Exception:
-                # Fallback to safe concatenation if template formatting fails
                 logger.exception("IMAGE_ENHANCER_TEMPLATE formatting failed, falling back to concatenation")
                 enhanced_prompt = f"{prompt}, {tpl}"
         else:
@@ -278,52 +254,72 @@ def generate_image_router(prompt: str, hf_model: str = "black-forest-labs/FLUX.1
     else:
         enhanced_prompt = prompt
 
-    # Cycle through HF tokens (round-robin). For each token, attempt retries with exponential backoff
-    tried_tokens = 0
-    total_tokens = max(1, len(_HF_TOKENS))
+    # Try rotating HF tokens if set, otherwise fall back to environment single token
+    tried = 0
+    total = max(1, len(_HF_TOKENS))
+    last_exc = None
 
-    while tried_tokens < total_tokens:
-        token = _pick_key(_HF_TOKENS, "hf")
+    while tried < total:
+        token = _pick_key(_HF_TOKENS, "hf") or os.environ.get("HF_TOKEN")
         if not token:
-            break
+            raise ValueError("Hugging Face API Token (HF_TOKEN) is missing.")
 
-        attempt = 0
-        while attempt < HF_MAX_RETRIES:
-            attempt += 1
-            try:
-                return _call_hf_image_model(enhanced_prompt, hf_model, token)
-            except requests.exceptions.HTTPError as http_err:
-                # Try to inspect status code for transient errors
+        try:
+            client = InferenceClient(provider="auto", api_key=token)
+
+            # Use the text_to_image helper; different HF providers may return
+            # either a PIL.Image.Image or bytes. Handle both.
+            image_obj = client.text_to_image(enhanced_prompt, model=hf_model)
+
+            # If it's bytes, return directly
+            if isinstance(image_obj, (bytes, bytearray)):
+                return bytes(image_obj)
+
+            # If it's a PIL Image, convert to PNG bytes
+            if isinstance(image_obj, Image.Image):
+                buf = io.BytesIO()
+                image_obj.save(buf, format="PNG")
+                return buf.getvalue()
+
+            # If it's a dict with base64 data
+            if isinstance(image_obj, dict):
+                # common key 'image' or nested data
+                import base64
+                if "image" in image_obj and isinstance(image_obj["image"], str):
+                    return base64.b64decode(image_obj["image"])
+                if "data" in image_obj and isinstance(image_obj["data"], list):
+                    for item in image_obj["data"]:
+                        if isinstance(item, dict) and "b64_json" in item:
+                            return base64.b64decode(item["b64_json"])
+                # fallback to stringified payload
+                return str(image_obj).encode("utf-8")
+
+            # Last resort: stringify
+            return str(image_obj).encode("utf-8")
+
+        except Exception as e:
+            last_exc = e
+            # Inspect for transient HTTP errors if requests exception available
+            if isinstance(e, requests.exceptions.HTTPError):
                 status = None
                 try:
-                    status = http_err.response.status_code  # type: ignore[attr-defined]
+                    status = e.response.status_code  # type: ignore[attr-defined]
                 except Exception:
                     status = None
                 if status in (429, 502, 503):
-                    backoff = HF_BACKOFF_BASE * (2 ** (attempt - 1))
-                    logger.warning(f"Transient HF HTTP {status} error on attempt {attempt}. Backing off {backoff}s and retrying.")
-                    logger.exception("Flux Image Generation Failed")
+                    backoff = HF_BACKOFF_BASE * (2 ** tried)
+                    logger.warning(f"Transient HF HTTP {status} error. Backing off {backoff}s and retrying.")
                     time.sleep(backoff)
+                    tried += 1
                     continue
-                else:
-                    # Non-transient HTTP error - log and break to try next token
-                    logger.exception("Flux Image Generation Failed")
-                    break
-            except Exception:
-                # Non-HTTP exceptions could be network errors, decode errors, etc.
-                logger.exception("Flux Image Generation Failed")
-                # For generic exceptions, treat as transient and backoff a bit
-                backoff = HF_BACKOFF_BASE * (2 ** (attempt - 1))
-                time.sleep(backoff)
-                continue
+            logger.exception("Flux Image Generation Failed")
+            # rotate token and try next
+            tried += 1
+            continue
 
-        # This token exhausted; try next
-        tried_tokens += 1
-        logger.warning("HF token exhausted or failed repeatedly; rotating to next token if available.")
-
-    # If we reach here, all tokens/retries failed
-    logger.error("All Hugging Face Flux tokens failed to generate the image")
-    raise RuntimeError("All Hugging Face Flux tokens failed to generate the image")
+    # If we reach here, all tokens failed
+    logger.error("All Hugging Face Flux tokens failed to generate the image: %s", last_exc)
+    raise RuntimeError(f"All Hugging Face Flux tokens failed to generate the image: {last_exc}")
 
 
 def is_secret_request(user_text: str) -> bool:
